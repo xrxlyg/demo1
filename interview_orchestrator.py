@@ -98,6 +98,7 @@ class InterviewOrchestrator:
         training_data_dir:  str  = "training_data",
         candidate_name:     str  = "candidate",
         max_questions:      int  = MAX_TOTAL_QUESTIONS,
+        enforce_coverage_guard: bool = False,
         # Agent overrides（测试用）
         policy:           Optional[InterviewPolicy]        = None,
         evaluator:        Optional[AnswerEvaluatorAgent]   = None,
@@ -113,6 +114,7 @@ class InterviewOrchestrator:
         self.dimension_pool = dimension_pool
         self.dimension_tree = dimension_tree
         self.max_questions  = max_questions
+        self.enforce_coverage_guard = bool(enforce_coverage_guard)
 
         self.save_training_data = save_training_data
         self.training_data_dir  = training_data_dir
@@ -297,8 +299,10 @@ class InterviewOrchestrator:
         # ── Step 4: 图感知 argmax 选题 ────────────────────────────────────
         target = self._select_next_question()
 
-        # ── Step 5: Coverage guard（followup 跳过 — Fix 2）───────────────
-        if not target.is_followup:
+        # ── Step 5: Optional coverage constraint ─────────────────────────
+        # Disabled by default so it cannot overwrite the Bayesian argmax and
+        # artificially create a coverage advantage in policy comparisons.
+        if self.enforce_coverage_guard and not target.is_followup:
             target = self._apply_coverage_guard(target)
 
         # ── Step 6: Phase 同步 ────────────────────────────────────────────
@@ -403,6 +407,7 @@ class InterviewOrchestrator:
             question_type=q_type,
             target_difficulty=self._current_difficulty,
             recent_skills=self._get_recent_skills(window=6),
+            skill_graph=self._skill_graph if q_type == "technical" else None,
         )
 
     # =========================================================================

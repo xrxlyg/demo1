@@ -1,335 +1,382 @@
 """
-question_selector.py  (v6)
+Decision-risk question selection for adaptive technical interviews.
 
-v5 → v6 核心变更：
-    ✅ 删除内部 AbilityEstimate / AbilityModel 定义
-       改为直接使用 ability_model.py 中的 AbilityModel / SkillAbility
-    ✅ 所有读取不确定性的地方从 .std 改为 .uncertainty
-    ✅ information_gain() 直接调用 SkillAbility.information_gain()
-    ✅ 其余评分逻辑（SP / branch / UCB）完整保留
+This replaces the former weighted heuristic (IG + CG + DM + DR plus graph
+bonuses).  A candidate question is valued by the expected Bayesian reduction
+in (1) job-decision variance and (2) total skill uncertainty.  Difficulty
+mismatch increases expected observation noise, and conversational repetition
+is represented as an explicit question cost.
 """
 
 from __future__ import annotations
 
-import math
 import logging
+import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
-# ── 使用项目统一的 AbilityModel ──────────────────────────────────────────────
 from ability_model import AbilityModel, SkillAbility
 
+
 logger = logging.getLogger(__name__)
+_EPS = 1e-12
 
+DIFFICULTY_TARGET: Dict[str, float] = {
+    "easy": 0.30,
+    "medium": 0.55,
+    "hard": 0.80,
+}
 
-# ── Difficulty target ─────────────────────────────────────────────────────────
-DIFFICULTY_TARGET: Dict[str, float] = {"easy": 0.30, "medium": 0.55, "hard": 0.80}
-DEFAULT_WEIGHTS = dict(alpha=0.35, beta=0.30, gamma=0.20, delta=0.15)
+# Utility = decision * relative decision-risk reduction
+#         + global   * relative trace reduction, divided by question cost.
+DEFAULT_WEIGHTS = {"decision": 0.70, "global": 0.30}
 
-# ── Branch hyper-parameters ───────────────────────────────────────────────────
-LAMBDA_BRANCH_PENALTY: float = 0.5
-ETA_BRANCH_BONUS:      float = 0.10
-KAPPA_UCB:             float = 0.10
-
-# ── Structural Prior hyper-parameters ────────────────────────────────────────
-SP_WEIGHT_DEPTH:   float = 0.12
-SP_WEIGHT_BREADTH: float = 0.08
-SP_WEIGHT_ORDER:   float = 0.05
-SP_DECAY_STEPS:    int   = 5
-
-
-# ── QuestionTarget ────────────────────────────────────────────────────────────
 
 @dataclass
 class QuestionTarget:
-    target:        str
-    question_type: str   = "technical"
-    difficulty:    str   = "medium"
-    is_followup:   bool  = False
-    score:         float = 0.0
-    reasoning:     str   = ""
-    components:    Dict  = field(default_factory=dict)
+    target: str
+    question_type: str = "technical"
+    difficulty: str = "medium"
+    is_followup: bool = False
+    score: float = 0.0
+    reasoning: str = ""
+    components: Dict = field(default_factory=dict)
 
 
-# ── v3 Scoring Functions ──────────────────────────────────────────────────────
+def _difficulty_efficiency(mean: float, difficulty: str, bandwidth: float = 0.22) -> float:
+    """
+    Expected measurement efficiency of an item at the current ability.
 
-def information_gain(e: SkillAbility) -> float:
-    """Delegate to SkillAbility's own method, cap at 1."""
-    return min(e.information_gain(), 1.0)
+    Questions far above or below current ability are treated as noisier rather
+    than receiving an arbitrary additive difficulty bonus.
+    """
+    target = DIFFICULTY_TARGET.get(difficulty, DIFFICULTY_TARGET["medium"])
+    z = (mean - target) / max(bandwidth, _EPS)
+    return 0.15 + 0.85 * math.exp(-0.5 * z * z)
 
-def coverage_gain(e: SkillAbility) -> float:
-    """CG = 1 if never asked, else decays with observations."""
-    return 1.0 if e.observations == 0 else max(0.0, 1.0 - 0.2 * e.observations)
 
-def difficulty_match(e: SkillAbility, target_difficulty: str) -> float:
-    """DM = max(0, 1 - 2|μ - t_d|)"""
-    t_d = DIFFICULTY_TARGET.get(target_difficulty, 0.55)
-    return max(0.0, 1.0 - 2.0 * abs(e.mean - t_d))
+def _recent_count(skill: str, recent_skills: List[str]) -> int:
+    return sum(1 for name in recent_skills if name == skill)
 
-def dialogue_relevance(skill: str, recent: List[str]) -> float:
-    if not recent:           return 1.0
-    if skill == recent[-1]:  return 0.0
-    if skill in recent[-4:]: return 0.4
-    return 1.0
 
-def score_question(
-    skill: str, estimate: SkillAbility,
-    recent_skills: List[str], target_difficulty: str,
-    alpha=DEFAULT_WEIGHTS["alpha"], beta=DEFAULT_WEIGHTS["beta"],
-    gamma=DEFAULT_WEIGHTS["gamma"], delta=DEFAULT_WEIGHTS["delta"],
+def _dimension_score(
+    ability_model: AbilityModel,
+    dimension: str,
+    target_difficulty: str,
+    recent_skills: List[str],
+    weights: Mapping[str, float],
+    repeat_cost: float,
 ) -> Tuple[float, Dict]:
-    ig = information_gain(estimate)
-    cg = coverage_gain(estimate)
-    dm = difficulty_match(estimate, target_difficulty)
-    dr = dialogue_relevance(skill, recent_skills)
-    total = alpha*ig + beta*cg + gamma*dm + delta*dr
-    return total, {
-        "IG": round(ig, 4), "CG": round(cg, 4),
-        "DM": round(dm, 4), "DR": round(dr, 4),
-        "total": round(total, 4),
+    ability = ability_model.dimensions.get(dimension, SkillAbility())
+    efficiency = _difficulty_efficiency(ability.mean, target_difficulty)
+    noise = ability_model.observation_variance / efficiency
+    reduction = ability.variance ** 2 / max(ability.variance + noise, _EPS)
+    relative_reduction = reduction / max(ability.variance, _EPS)
+    cost = 1.0 + repeat_cost * _recent_count(dimension, recent_skills)
+    total = relative_reduction / cost
+    components = {
+        "decision_reduction": round(reduction, 6),
+        "global_reduction": round(reduction, 6),
+        "relative_decision_reduction": round(relative_reduction, 6),
+        "relative_global_reduction": round(relative_reduction, 6),
+        "difficulty_efficiency": round(efficiency, 6),
+        "observation_variance": round(noise, 6),
+        "question_cost": round(cost, 6),
+        "total": round(total, 6),
     }
-
-
-# ── Structural Prior ──────────────────────────────────────────────────────────
-
-def _lookup_node(name: str, skill_graph):
-    if hasattr(skill_graph, "nodes"): return skill_graph.nodes.get(name)
-    if hasattr(skill_graph, "get"):   return skill_graph.get(name)
-    return None
-
-def _node_metadata(skill: str, skill_graph) -> Tuple[int, int, int]:
-    if skill_graph is None: return 1, 1, 0
-    node = _lookup_node(skill, skill_graph)
-    if node is None: return 1, 1, 0
-    depth = getattr(node, "depth", 1)
-    subtree_size = 1
-    if hasattr(skill_graph, "get_descendants"):
-        subtree_size = 1 + len(skill_graph.get_descendants(skill))
-    sibling_index = 0
-    parent = getattr(node, "parent", None)
-    if parent and hasattr(skill_graph, "children_of"):
-        names = [s.name for s in skill_graph.children_of(parent)]
-        sibling_index = names.index(skill) if skill in names else 0
-    return depth, subtree_size, sibling_index
-
-def structural_prior(
-    skill: str, estimate: SkillAbility, skill_graph,
-    max_depth: int = 4, max_breadth: int = 10, max_siblings: int = 8,
-) -> float:
-    decay = max(0.0, 1.0 - estimate.observations / SP_DECAY_STEPS)
-    if decay == 0.0 or skill_graph is None:
-        return 0.0
-    depth, subtree_size, sibling_index = _node_metadata(skill, skill_graph)
-    depth_score   = 1.0 - min(depth, max_depth)    / max_depth
-    breadth_score = min(subtree_size, max_breadth)  / max_breadth
-    order_score   = 1.0 - min(sibling_index, max_siblings) / max_siblings
-    return decay * (
-        SP_WEIGHT_DEPTH   * depth_score
-        + SP_WEIGHT_BREADTH * breadth_score
-        + SP_WEIGHT_ORDER   * order_score
-    )
-
-
-# ── Branch Utilities ──────────────────────────────────────────────────────────
-
-def _get_branch(skill: str, skill_graph) -> Optional[str]:
-    if skill_graph is None: return None
-    node = _lookup_node(skill, skill_graph)
-    if node is None: return None
-    if getattr(node, "depth", 1) <= 1: return node.name
-    current = node
-    while current.parent:
-        p = _lookup_node(current.parent, skill_graph)
-        if p is None: break
-        if getattr(p, "depth", 0) == 1: return p.name
-        current = p
-    return current.name
-
-def _branch_freq(skill: str, recent: List[str], skill_graph, window: int = 6) -> float:
-    if not recent or skill_graph is None: return 0.0
-    tb = _get_branch(skill, skill_graph)
-    if tb is None: return 0.0
-    r = recent[-window:]
-    return sum(1 for s in r if _get_branch(s, skill_graph) == tb) / len(r)
-
-def _branch_coverage(branch: str, skill_graph, am: AbilityModel) -> float:
-    if skill_graph is None: return 1.0
-    desc = skill_graph.get_descendants(branch) if hasattr(skill_graph, "get_descendants") else []
-    if not desc:
-        return 1.0 if am.skills.get(branch, SkillAbility()).observations > 0 else 0.0
-    covered = sum(1 for s in desc if am.skills.get(s, SkillAbility()).observations > 0)
-    return covered / len(desc)
-
-def branch_penalty_factor(skill: str, recent: List[str], skill_graph) -> float:
-    return math.exp(-LAMBDA_BRANCH_PENALTY * _branch_freq(skill, recent, skill_graph))
-
-def branch_coverage_bonus(skill: str, skill_graph, am: AbilityModel) -> float:
-    if skill_graph is None: return 0.0
-    tb = _get_branch(skill, skill_graph)
-    if tb is None: return 0.0
-    return ETA_BRANCH_BONUS * (1.0 - _branch_coverage(tb, skill_graph, am))
-
-def ucb_bonus(skill: str, am: AbilityModel, T: int) -> float:
-    N = am.skills.get(skill, SkillAbility()).observations
-    return KAPPA_UCB * math.sqrt(math.log(max(T, 1)) / (1.0 + N))
-
-
-# ── Combined Scoring ──────────────────────────────────────────────────────────
-
-def score_question_full(
-    skill: str, estimate: SkillAbility, recent_skills: List[str],
-    target_difficulty: str, ability_model: AbilityModel,
-    total_questions: int, skill_graph=None,
-    alpha=DEFAULT_WEIGHTS["alpha"], beta=DEFAULT_WEIGHTS["beta"],
-    gamma=DEFAULT_WEIGHTS["gamma"], delta=DEFAULT_WEIGHTS["delta"],
-) -> Tuple[float, Dict]:
-    v3_base, comps = score_question(skill, estimate, recent_skills,
-                                    target_difficulty, alpha, beta, gamma, delta)
-    sp      = structural_prior(skill, estimate, skill_graph)
-    bb      = branch_coverage_bonus(skill, skill_graph, ability_model)
-    ucb     = ucb_bonus(skill, ability_model, total_questions)
-    penalty = branch_penalty_factor(skill, recent_skills, skill_graph)
-    final   = (v3_base + sp + bb + ucb) * penalty
-    comps.update({
-        "v3_base":        round(v3_base, 4),
-        "SP":             round(sp, 4),
-        "branch_bonus":   round(bb, 4),
-        "ucb_bonus":      round(ucb, 4),
-        "branch_penalty": round(penalty, 4),
-        "total":          round(final, 4),
+    # Deprecated display aliases used by the old example script.  They no
+    # longer denote the former heuristic terms.
+    components.update({
+        "IG": components["relative_decision_reduction"],
+        "CG": components["relative_global_reduction"],
+        "DM": components["difficulty_efficiency"],
+        "DR": round(1.0 / cost, 6),
     })
-    return final, comps
+    return total, components
 
 
-# ── QuestionSelector ──────────────────────────────────────────────────────────
+def score_question_bayesian(
+    skill: str,
+    ability_model: AbilityModel,
+    recent_skills: List[str],
+    target_difficulty: str,
+    skill_graph=None,
+    weights: Optional[Mapping[str, float]] = None,
+    repeat_cost: float = 0.15,
+) -> Tuple[float, Dict]:
+    """Score a technical target by closed-form expected posterior risk reduction."""
+    ability_model.configure_skill_graph(skill_graph)
+    ability = ability_model.skills.get(skill, SkillAbility())
+    utility_weights = dict(weights or DEFAULT_WEIGHTS)
+    job_weights = ability_model.get_job_weights(skill_graph)
+
+    efficiency = _difficulty_efficiency(ability.mean, target_difficulty)
+    effective_noise = ability_model.observation_variance / efficiency
+
+    decision_reduction = ability_model.expected_decision_variance_reduction(
+        skill,
+        job_weights,
+        observation_variance=effective_noise,
+    )
+    global_reduction = ability_model.expected_total_variance_reduction(
+        skill,
+        observation_variance=effective_noise,
+    )
+    decision_variance = ability_model.decision_variance(job_weights)
+    total_variance = ability_model.total_skill_variance()
+
+    relative_decision = decision_reduction / max(decision_variance, _EPS)
+    relative_global = global_reduction / max(total_variance, _EPS)
+    cost = 1.0 + repeat_cost * _recent_count(skill, recent_skills)
+
+    total = (
+        utility_weights["decision"] * relative_decision
+        + utility_weights["global"] * relative_global
+    ) / cost
+
+    components = {
+        "decision_reduction": round(decision_reduction, 6),
+        "global_reduction": round(global_reduction, 6),
+        "relative_decision_reduction": round(relative_decision, 6),
+        "relative_global_reduction": round(relative_global, 6),
+        "difficulty_efficiency": round(efficiency, 6),
+        "observation_variance": round(effective_noise, 6),
+        "question_cost": round(cost, 6),
+        "total": round(total, 6),
+    }
+    # Deprecated display aliases used by the old example script.  They no
+    # longer denote the former heuristic terms.
+    components.update({
+        "IG": components["relative_decision_reduction"],
+        "CG": components["relative_global_reduction"],
+        "DM": components["difficulty_efficiency"],
+        "DR": round(1.0 / cost, 6),
+    })
+    return total, components
+
 
 class QuestionSelector:
+    """Select the question with maximum expected Bayesian risk reduction."""
 
-    def __init__(self, weights: Optional[Dict[str, float]] = None,
-                 followup_boost: float = 0.15) -> None:
-        self.weights        = weights or DEFAULT_WEIGHTS.copy()
-        self.followup_boost = followup_boost
+    def __init__(
+        self,
+        weights: Optional[Dict[str, float]] = None,
+        repeat_cost: float = 0.15,
+        followup_boost: Optional[float] = None,
+    ) -> None:
+        if weights and {"alpha", "beta", "gamma", "delta"}.intersection(weights):
+            logger.warning(
+                "Legacy alpha/beta/gamma/delta selector weights are ignored; "
+                "use {'decision': ..., 'global': ...}."
+            )
+            weights = None
+        self.weights = dict(weights or DEFAULT_WEIGHTS)
+        if "decision" not in self.weights or "global" not in self.weights:
+            raise ValueError("selector weights require 'decision' and 'global'")
+        weight_sum = self.weights["decision"] + self.weights["global"]
+        if weight_sum <= 0:
+            raise ValueError("selector weights must have a positive sum")
+        self.weights = {
+            "decision": self.weights["decision"] / weight_sum,
+            "global": self.weights["global"] / weight_sum,
+        }
+        self.repeat_cost = max(float(repeat_cost), 0.0)
+        if followup_boost is not None:
+            logger.warning("followup_boost is deprecated; repetition is modeled as cost.")
+
+    def _score(
+        self,
+        ability_model: AbilityModel,
+        target: str,
+        question_type: str,
+        target_difficulty: str,
+        recent_skills: List[str],
+        skill_graph=None,
+    ) -> Tuple[float, Dict]:
+        if question_type == "technical":
+            return score_question_bayesian(
+                skill=target,
+                ability_model=ability_model,
+                recent_skills=recent_skills,
+                target_difficulty=target_difficulty,
+                skill_graph=skill_graph,
+                weights=self.weights,
+                repeat_cost=self.repeat_cost,
+            )
+        return _dimension_score(
+            ability_model=ability_model,
+            dimension=target,
+            target_difficulty=target_difficulty,
+            recent_skills=recent_skills,
+            weights=self.weights,
+            repeat_cost=self.repeat_cost,
+        )
 
     def select(
-        self, ability_model: AbilityModel, candidates: List[str],
-        question_type: str, target_difficulty: str, recent_skills: List[str],
+        self,
+        ability_model: AbilityModel,
+        candidates: List[str],
+        question_type: str,
+        target_difficulty: str,
+        recent_skills: List[str],
         last_skill: Optional[str] = None,
         followup_counts: Optional[Dict[str, int]] = None,
         max_followup: int = 2,
     ) -> QuestionTarget:
-        """Competency / flat argmax — no branch/SP."""
         if not candidates:
-            return QuestionTarget(target="unknown", question_type="closing",
-                                  reasoning="No candidates available.")
-        fc = followup_counts or {}
-        w  = self.weights
+            return QuestionTarget(
+                target="unknown",
+                question_type="closing",
+                reasoning="No candidates available.",
+            )
+
+        followups = followup_counts or {}
         scored = []
-        for skill in candidates:
-            est = (ability_model.skills.get(skill, SkillAbility())
-                   if question_type == "technical"
-                   else ability_model.dimensions.get(skill, SkillAbility()))
-            total, comps = score_question(skill, est, recent_skills, target_difficulty,
-                                          w["alpha"], w["beta"], w["gamma"], w["delta"])
-            if (skill == last_skill and est.uncertainty > 0.15
-                    and fc.get(skill, 0) < max_followup):
-                total += self.followup_boost
-                comps["followup_boost"] = self.followup_boost
-            scored.append((total, skill, comps))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        bs, bsk, bc = scored[0]
-        reasoning = (f"argmax '{bsk}' score={bs:.4f} | "
-                     f"IG={bc['IG']:.3f} CG={bc['CG']:.3f} "
-                     f"DM={bc['DM']:.3f} DR={bc['DR']:.3f}")
-        return QuestionTarget(target=bsk, question_type=question_type,
-                              difficulty=target_difficulty, is_followup=(bsk == last_skill),
-                              score=bs, reasoning=reasoning, components=bc)
+        for target in candidates:
+            if (
+                len(candidates) > 1
+                and target == last_skill
+                and followups.get(target, 0) >= max_followup
+            ):
+                continue
+            total, components = self._score(
+                ability_model,
+                target,
+                question_type,
+                target_difficulty,
+                recent_skills,
+            )
+            scored.append((total, target, components))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_score, best_target, best_components = scored[0]
+        reasoning = (
+            f"Bayesian risk reduction argmax '{best_target}' score={best_score:.6f} | "
+            f"decision={best_components['relative_decision_reduction']:.4f} "
+            f"global={best_components['relative_global_reduction']:.4f} "
+            f"efficiency={best_components['difficulty_efficiency']:.4f} "
+            f"cost={best_components['question_cost']:.3f}"
+        )
+        return QuestionTarget(
+            target=best_target,
+            question_type=question_type,
+            difficulty=target_difficulty,
+            is_followup=(best_target == last_skill),
+            score=best_score,
+            reasoning=reasoning,
+            components=best_components,
+        )
 
     def select_with_graph(
-        self, ability_model: AbilityModel, skill_graph,
-        question_type: str, target_difficulty: str, recent_skills: List[str],
-        current_skill: Optional[str], traversal_state,
+        self,
+        ability_model: AbilityModel,
+        skill_graph,
+        question_type: str,
+        target_difficulty: str,
+        recent_skills: List[str],
+        current_skill: Optional[str],
+        traversal_state,
         followup_counts: Optional[Dict[str, int]] = None,
         max_followup: int = 2,
     ) -> QuestionTarget:
+        ability_model.configure_skill_graph(skill_graph)
         traversal_state.last_score = (
             ability_model.skills.get(current_skill, SkillAbility()).mean
-            if current_skill else 0.5)
+            if current_skill else 0.5
+        )
 
         if current_skill:
             next_from_graph, strategy = skill_graph.next_node(current_skill, traversal_state)
         else:
             next_from_graph = skill_graph.topic_switch()
-            strategy        = "topic_switch_init"
+            strategy = "topic_switch_init"
 
         local: List[str] = []
         if next_from_graph:
             node = skill_graph.get(next_from_graph)
             if node and node.parent:
-                local = [n.name for n in skill_graph.children_of(node.parent)]
+                local = [child.name for child in skill_graph.children_of(node.parent)]
             else:
                 local = [next_from_graph]
-        candidates = list(set(local + [r.name for r in skill_graph.roots()]))
+
+        candidates = list(dict.fromkeys(local + [root.name for root in skill_graph.roots()]))
         if not candidates:
             candidates = skill_graph.all_names()
 
-        fc = followup_counts or {}
-        w  = self.weights
-        T  = sum(a.observations for a in ability_model.skills.values()) or 1
-
+        followups = followup_counts or {}
         scored = []
-        for skill in candidates:
-            est   = ability_model.skills.get(skill, SkillAbility())
-            total, comps = score_question_full(
-                skill, est, recent_skills, target_difficulty,
-                ability_model, T, skill_graph,
-                w["alpha"], w["beta"], w["gamma"], w["delta"],
+        for target in candidates:
+            if (
+                len(candidates) > 1
+                and target == current_skill
+                and followups.get(target, 0) >= max_followup
+            ):
+                continue
+            total, components = self._score(
+                ability_model,
+                target,
+                question_type,
+                target_difficulty,
+                recent_skills,
+                skill_graph,
             )
-            if (skill == current_skill and est.uncertainty > 0.15
-                    and fc.get(skill, 0) < max_followup):
-                total += self.followup_boost
-                comps["followup_boost"] = self.followup_boost
-            scored.append((total, skill, comps))
+            scored.append((total, target, components))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        bs, bsk, bc = scored[0]
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_score, best_target, best_components = scored[0]
         reasoning = (
-            f"[{strategy}] argmax '{bsk}' score={bs:.4f} | "
-            f"v3_base={bc.get('v3_base',0):.3f} SP={bc.get('SP',0):.3f} "
-            f"branch_b={bc.get('branch_bonus',0):.3f} ucb={bc.get('ucb_bonus',0):.3f} "
-            f"penalty={bc.get('branch_penalty',1):.3f}"
+            f"[{strategy}] Bayesian risk argmax '{best_target}' score={best_score:.6f} | "
+            f"decision={best_components['relative_decision_reduction']:.4f} "
+            f"global={best_components['relative_global_reduction']:.4f} "
+            f"efficiency={best_components['difficulty_efficiency']:.4f} "
+            f"cost={best_components['question_cost']:.3f}"
         )
-        logger.info("select_with_graph | best=%s branch=%s score=%.4f | %s",
-                    bsk, _get_branch(bsk, skill_graph), bs, reasoning)
-        return QuestionTarget(target=bsk, question_type=question_type,
-                              difficulty=target_difficulty, is_followup=(bsk == current_skill),
-                              score=bs, reasoning=reasoning, components=bc)
+        logger.info("select_with_graph | best=%s score=%.6f | %s", best_target, best_score, reasoning)
+        return QuestionTarget(
+            target=best_target,
+            question_type=question_type,
+            difficulty=target_difficulty,
+            is_followup=(best_target == current_skill),
+            score=best_score,
+            reasoning=reasoning,
+            components=best_components,
+        )
 
-
-# ── Diagnostic ────────────────────────────────────────────────────────────────
 
 def score_all(
-    ability_model: AbilityModel, candidates: List[str],
-    question_type: str, target_difficulty: str, recent_skills: List[str],
-    weights: Optional[Dict[str, float]] = None, skill_graph=None,
+    ability_model: AbilityModel,
+    candidates: List[str],
+    question_type: str,
+    target_difficulty: str,
+    recent_skills: List[str],
+    weights: Optional[Dict[str, float]] = None,
+    skill_graph=None,
 ) -> List[Dict]:
-    w = weights or DEFAULT_WEIGHTS
-    T = sum(a.observations for a in ability_model.skills.values()) or 1
+    selector = QuestionSelector(weights=weights)
     results = []
-    for skill in candidates:
-        est = (ability_model.skills.get(skill, SkillAbility())
-               if question_type == "technical"
-               else ability_model.dimensions.get(skill, SkillAbility()))
-        if skill_graph is not None and question_type == "technical":
-            total, comps = score_question_full(
-                skill, est, recent_skills, target_difficulty,
-                ability_model, T, skill_graph, **w)
-        else:
-            total, comps = score_question(
-                skill, est, recent_skills, target_difficulty, **w)
-        results.append({"skill": skill, **comps, "estimate": {
-            "mean": round(est.mean, 4),
-            "uncertainty": round(est.uncertainty, 4),
-            "observations": est.observations,
-        }})
-    results.sort(key=lambda x: x["total"], reverse=True)
+    for target in candidates:
+        total, components = selector._score(
+            ability_model,
+            target,
+            question_type,
+            target_difficulty,
+            recent_skills,
+            skill_graph,
+        )
+        ability = (
+            ability_model.skills.get(target, SkillAbility())
+            if question_type == "technical"
+            else ability_model.dimensions.get(target, SkillAbility())
+        )
+        results.append({
+            "skill": target,
+            **components,
+            "estimate": {
+                "mean": round(ability.mean, 4),
+                "variance": round(ability.variance, 6),
+                "std": round(ability.uncertainty, 4),
+                "observations": ability.observations,
+            },
+        })
+    results.sort(key=lambda item: (-item["total"], item["skill"]))
     return results
