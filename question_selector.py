@@ -74,7 +74,7 @@ def _dimension_score(
     relative_reduction = reduction / max(ability.variance, _EPS)
     cost = 1.0 + repeat_cost * _recent_count(dimension, recent_skills)
     total = relative_reduction / cost
-    return total, {
+    components = {
         "decision_reduction": round(reduction, 6),
         "global_reduction": round(reduction, 6),
         "relative_decision_reduction": round(relative_reduction, 6),
@@ -84,6 +84,15 @@ def _dimension_score(
         "question_cost": round(cost, 6),
         "total": round(total, 6),
     }
+    # Deprecated display aliases used by the old example script.  They no
+    # longer denote the former heuristic terms.
+    components.update({
+        "IG": components["relative_decision_reduction"],
+        "CG": components["relative_global_reduction"],
+        "DM": components["difficulty_efficiency"],
+        "DR": round(1.0 / cost, 6),
+    })
+    return total, components
 
 
 def score_question_bayesian(
@@ -125,7 +134,7 @@ def score_question_bayesian(
         + utility_weights["global"] * relative_global
     ) / cost
 
-    return total, {
+    components = {
         "decision_reduction": round(decision_reduction, 6),
         "global_reduction": round(global_reduction, 6),
         "relative_decision_reduction": round(relative_decision, 6),
@@ -135,6 +144,15 @@ def score_question_bayesian(
         "question_cost": round(cost, 6),
         "total": round(total, 6),
     }
+    # Deprecated display aliases used by the old example script.  They no
+    # longer denote the former heuristic terms.
+    components.update({
+        "IG": components["relative_decision_reduction"],
+        "CG": components["relative_global_reduction"],
+        "DM": components["difficulty_efficiency"],
+        "DR": round(1.0 / cost, 6),
+    })
+    return total, components
 
 
 class QuestionSelector:
