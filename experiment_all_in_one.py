@@ -6,11 +6,11 @@ Kept:
   1. A fixed six-cluster / 29-skill graph.
   2. A joint Gaussian Bayesian ability model.
   3. BRIDGE, uncertainty-only, random, and strong fixed-order selectors.
-  4. Synthetic Exp. 1/2 and an optional Qwen end-to-end pilot.
+  4. Synthetic Exp. 1/2 and an optional three-role Qwen end-to-end pilot.
 
 Removed:
   JD parsing, resume parsing, LLM-generated skill trees, multi-agent routing,
-  competency interviews, dynamic question generation, and training-data code.
+  competency interviews and training-data code.
 
 Examples:
   python experiment_all_in_one.py --mode exp1 --output runs
@@ -20,10 +20,11 @@ Examples:
 Qwen calls are never included in --mode all.  They require an explicit mode:
   export DASHSCOPE_API_KEY=...
   python experiment_all_in_one.py --mode qwen \
-      --candidate-model <stronger-qwen-model> \
-      --judge-model <different-qwen-model> \
+      --question-model qwen-turbo --question-judge-model qwen-max \
+      --candidate-model qwen-max --judge-model qwen-max \
       --qwen-candidates 30 --qwen-questions 12 \
-      --strategies bridge random --judge-repeats 3 \
+      --strategies bridge random --question-judge-repeats 3 \
+      --quality-threshold 7 --max-regenerations 2 --judge-repeats 3 \
       --confirm-api-calls --output runs
 
 All abilities and evaluator scores use the [1, 10] scale.
@@ -49,6 +50,23 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+try:
+    from tqdm import tqdm
+except ImportError:  # Keep the stdlib-only synthetic experiments runnable.
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, total: int, initial: int = 0, desc: str = "") -> None:
+            self.total, self.n, self.desc = total, initial, desc
+
+        def __enter__(self):
+            print(f"{self.desc}: {self.n}/{self.total}", file=sys.stderr)
+            return self
+
+        def __exit__(self, *_args) -> None:
+            print(f"{self.desc}: {self.n}/{self.total}", file=sys.stderr)
+
+        def update(self, amount: int = 1) -> None:
+            self.n += amount
 
 
 # =============================================================================
@@ -845,23 +863,158 @@ def ability_band(theta: float) -> str:
     return "具备深入生产经验；能够讨论原理、权衡、故障场景和工程边界"
 
 
-def build_question(skill: str, difficulty: str, variant: int) -> str:
-    templates = {
-        "easy": [
-            "请解释 {skill} 的核心概念，并说明一个常见使用场景。",
-            "在后端开发中，{skill} 主要解决什么问题？请给出简单例子。",
-        ],
-        "medium": [
-            "请结合一个生产项目说明你如何使用 {skill}，以及主要的设计权衡。",
-            "使用 {skill} 时容易出现哪些故障？你会如何定位和处理？",
-        ],
-        "hard": [
-            "请设计一个依赖 {skill} 的高并发系统，并分析一致性、性能和故障恢复权衡。",
-            "如果 {skill} 在峰值流量下发生级联故障，你会如何诊断、降级并长期改进？",
-        ],
+QUESTION_QUALITY_DIMENSIONS = (
+    "skill_relevance",
+    "difficulty_match",
+    "clarity",
+    "non_redundancy",
+    "contextual_coherence",
+)
+
+
+def generate_qwen_question(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    rejected_attempts: Sequence[Mapping],
+) -> str:
+    """Generate one interview question; the returned value is the raw model text."""
+    history = list(dialogue_history)[-3:]
+    history_text = "\n".join(
+        f"第{row['turn'] + 1}轮：问题：{row['question']} 回答：{row['answer']}"
+        for row in history
+    ) or "无，这是第一轮。"
+    rejected_text = "\n".join(
+        f"- 问题：{row['question']}；评审反馈：{row['feedback']}"
+        for row in rejected_attempts
+    ) or "无"
+    difficulty_guidance = {
+        "easy": "考查核心概念与常见场景，避免复杂系统设计",
+        "medium": "考查项目应用、故障分析和主要工程权衡",
+        "hard": "考查复杂系统设计、边界条件、多重权衡与故障恢复",
+    }[difficulty]
+    system = (
+        "你是技术面试问题生成器。只生成一个中文问题，不要给答案、解释、标题、"
+        "评分或Markdown。问题必须聚焦指定技能，符合难度，并与对话自然衔接。"
+    )
+    user = (
+        f"目标技能：{skill}\n目标难度：{difficulty}（{difficulty_guidance}）\n"
+        f"最近对话：\n{history_text}\n"
+        f"本轮已被拒绝的尝试（必须针对反馈改写且避免重复）：\n{rejected_text}\n"
+        "请输出新的单一面试问题。"
+    )
+    return client.chat(model, system, user, temperature=0.8, max_tokens=300)
+
+
+def parse_question_quality_json(raw: str) -> Dict:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("Question judge output does not contain a JSON object")
+    data = json.loads(cleaned[start:end + 1])
+    parsed = {}
+    for name in (*QUESTION_QUALITY_DIMENSIONS, "overall_question_quality"):
+        value = float(data[name])
+        if not 1.0 <= value <= 10.0:
+            raise ValueError(f"Question quality score outside [1,10] for {name}: {value}")
+        parsed[name] = value
+    parsed["reason"] = str(data.get("reason", ""))[:500]
+    return parsed
+
+
+def evaluate_qwen_question(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    question: str,
+    dialogue_history: Sequence[Mapping],
+    repeats: int,
+) -> Tuple[Dict[str, float], List[Dict]]:
+    prior_dialogue = [
+        {
+            "skill": row["skill"],
+            "question": row["question"],
+            "answer": row["answer"],
+        }
+        for row in dialogue_history[-6:]
+    ]
+    system = (
+        "你是严格的高级技术面试问题评审器。分别按1到10分评价："
+        "skill_relevance（技能相关性）、difficulty_match（难度匹配）、"
+        "clarity（清晰且可回答）、non_redundancy（相对历史问题不重复）、"
+        "contextual_coherence（与上一轮对话连贯），并给出overall_question_quality。"
+        "只输出JSON，包含上述六个数字字段及reason字符串。"
+    )
+    user = (
+        f"目标技能：{skill}\n目标难度：{difficulty}\n候选问题：{question}\n"
+        f"此前对话：{json.dumps(prior_dialogue, ensure_ascii=False)}"
+    )
+    details = []
+    for _ in range(repeats):
+        raw = client.chat(model, system, user, temperature=0.2, max_tokens=400)
+        parsed = parse_question_quality_json(raw)
+        parsed["raw"] = raw
+        details.append(parsed)
+    score_names = (*QUESTION_QUALITY_DIMENSIONS, "overall_question_quality")
+    means = {
+        name: sum(row[name] for row in details) / len(details)
+        for name in score_names
     }
-    choices = templates[difficulty]
-    return choices[variant % len(choices)].format(skill=skill)
+    return means, details
+
+
+def generate_qualified_question(
+    client: QwenClient,
+    question_model: str,
+    question_judge_model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+) -> Tuple[str, Dict[str, float], int, List[Dict]]:
+    attempts = []
+    rejected = []
+    for attempt_index in range(max_regenerations + 1):
+        raw_question = generate_qwen_question(
+            client, question_model, skill, difficulty, dialogue_history, rejected
+        )
+        question = raw_question.strip()
+        quality_scores, judge_details = evaluate_qwen_question(
+            client,
+            question_judge_model,
+            skill,
+            difficulty,
+            question,
+            dialogue_history,
+            judge_repeats,
+        )
+        attempts.append({
+            "attempt": attempt_index,
+            "question": question,
+            "question_model_raw_output": raw_question,
+            "quality_scores": quality_scores,
+            "question_judge_details": judge_details,
+        })
+        if quality_scores["overall_question_quality"] >= quality_threshold:
+            break
+        rejected.append({
+            "question": question,
+            "feedback": "; ".join(row["reason"] for row in judge_details if row["reason"]),
+        })
+    accepted = attempts[-1]
+    return (
+        accepted["question"],
+        accepted["quality_scores"],
+        len(attempts) - 1,
+        attempts,
+    )
 
 
 def generate_qwen_answer(
@@ -924,11 +1077,16 @@ def run_qwen(
     output_root: Path,
     api_key: str,
     base_url: str,
+    question_model: str,
+    question_judge_model: str,
     candidate_model: str,
     judge_model: str,
     n_candidates: int,
     questions: int,
     strategies: Sequence[str],
+    question_judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
     judge_repeats: int,
     seed: int,
     request_delay: float,
@@ -937,7 +1095,33 @@ def run_qwen(
     output_dir.mkdir(parents=True, exist_ok=True)
     profiles_path = output_dir / "profiles.json"
     turns_path = output_dir / "turns.jsonl"
+    setup_path = output_dir / "setup.json"
     profiles = generate_profiles(n_candidates, seed)
+
+    setup = {
+        "schema_version": 2,
+        "seed": seed,
+        "question_model": question_model,
+        "question_judge_model": question_judge_model,
+        "candidate_model": candidate_model,
+        "judge_model": judge_model,
+        "question_judge_repeats": question_judge_repeats,
+        "quality_threshold": quality_threshold,
+        "max_regenerations": max_regenerations,
+        "judge_repeats": judge_repeats,
+        "candidates": n_candidates,
+        "questions": questions,
+        "strategies": list(strategies),
+    }
+    if setup_path.exists():
+        saved_setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        if saved_setup != setup:
+            raise ValueError(
+                "Existing exp3_qwen/setup.json does not match this run; "
+                "use the original arguments or a different --output directory"
+            )
+    else:
+        atomic_json(setup_path, setup)
 
     if profiles_path.exists():
         saved = json.loads(profiles_path.read_text(encoding="utf-8"))
@@ -950,6 +1134,11 @@ def run_qwen(
     grouped = defaultdict(list)
     seen_keys = set()
     for row in existing:
+        if "question_quality_scores" not in row:
+            raise ValueError(
+                "Existing turns.jsonl uses the old fixed-question schema; "
+                "use a different --output directory for the new experiment"
+            )
         key = (row["strategy"], row["candidate_id"], row["turn"])
         if key in seen_keys:
             raise ValueError(f"Duplicate Qwen record: {key}")
@@ -959,62 +1148,90 @@ def run_qwen(
         rows.sort(key=lambda row: row["turn"])
 
     client = QwenClient(api_key, base_url)
-    for strategy in strategies:
-        for profile in profiles:
-            model = BayesianAbilityModel(graph_enabled=True)
-            recent = []
-            per_skill_count = defaultdict(int)
-            completed = grouped[(strategy, profile.candidate_id)]
-            for row in completed:
-                model.update(
-                    row["skill"],
-                    row["judge_score_mean"],
-                    observation_std=max(row["judge_score_std"], 0.35),
-                )
-                recent = (recent + [row["skill"]])[-6:]
-                per_skill_count[row["skill"]] += 1
+    total = n_candidates * len(strategies) * questions
+    with tqdm(total=total, initial=len(existing), desc="Qwen interview turns") as progress:
+        for strategy in strategies:
+            for profile in profiles:
+                model = BayesianAbilityModel(graph_enabled=True)
+                recent = []
+                completed = grouped[(strategy, profile.candidate_id)]
+                if len(completed) > questions or [row["turn"] for row in completed] != list(range(len(completed))):
+                    raise ValueError(
+                        f"Non-contiguous or excessive saved turns for {strategy}/{profile.candidate_id}"
+                    )
+                for row in completed:
+                    # Only the answer judge's ability score enters this posterior.
+                    model.update(
+                        row["skill"],
+                        row["judge_score_mean"],
+                        observation_std=max(row["judge_score_std"], 0.35),
+                    )
+                    recent = (recent + [row["skill"]])[-6:]
 
-            for turn in range(len(completed), questions):
-                skill, difficulty, components = select_skill(
-                    strategy, model, recent, turn, seed, profile.candidate_id
-                )
-                question = build_question(skill, difficulty, per_skill_count[skill])
-                answer = generate_qwen_answer(
-                    client, candidate_model, profile, skill, question
-                )
-                score_mean, score_std, judge_details = evaluate_qwen_answer(
-                    client, judge_model, skill, question, answer, judge_repeats
-                )
-                # A non-zero floor prevents a single deterministic judge call
-                # from creating unjustified near-zero posterior uncertainty.
-                update_std = max(score_std, 0.35)
-                model.update(skill, score_mean, observation_std=update_std)
-                recent = (recent + [skill])[-6:]
-                per_skill_count[skill] += 1
-                record = {
-                    "created_at": utc_now(),
-                    "strategy": strategy,
-                    "candidate_id": profile.candidate_id,
-                    "level": profile.level,
-                    "turn": turn,
-                    "skill": skill,
-                    "cluster": SKILL_TO_CLUSTER[skill],
-                    "difficulty": difficulty,
-                    "question": question,
-                    "answer": answer,
-                    "assigned_skill_theta": profile.skill_theta[skill],
-                    "judge_score_mean": score_mean,
-                    "judge_score_std": score_std,
-                    "judge_details": judge_details,
-                    "posterior_skill_mean": model.skill_mean(skill),
-                    "posterior_skill_std": math.sqrt(model.skill_variance(skill)),
-                    "posterior_job_mean": model.job_mean(),
-                    "posterior_job_std": math.sqrt(model.job_variance()),
-                    "selector": components,
-                }
-                append_jsonl(turns_path, record)
-                grouped[(strategy, profile.candidate_id)].append(record)
-                time.sleep(max(request_delay, 0.0))
+                for turn in range(len(completed), questions):
+                    skill, difficulty, components = select_skill(
+                        strategy, model, recent, turn, seed, profile.candidate_id
+                    )
+                    question, quality_scores, regeneration_count, question_attempts = (
+                        generate_qualified_question(
+                            client=client,
+                            question_model=question_model,
+                            question_judge_model=question_judge_model,
+                            skill=skill,
+                            difficulty=difficulty,
+                            dialogue_history=grouped[(strategy, profile.candidate_id)],
+                            judge_repeats=question_judge_repeats,
+                            quality_threshold=quality_threshold,
+                            max_regenerations=max_regenerations,
+                        )
+                    )
+                    answer = generate_qwen_answer(
+                        client, candidate_model, profile, skill, question
+                    )
+                    score_mean, score_std, judge_details = evaluate_qwen_answer(
+                        client, judge_model, skill, question, answer, judge_repeats
+                    )
+                    # A non-zero floor prevents a deterministic answer judge call
+                    # from creating unjustified near-zero posterior uncertainty.
+                    update_std = max(score_std, 0.35)
+                    model.update(skill, score_mean, observation_std=update_std)
+                    recent = (recent + [skill])[-6:]
+                    record = {
+                        "created_at": utc_now(),
+                        "strategy": strategy,
+                        "candidate_id": profile.candidate_id,
+                        "level": profile.level,
+                        "turn": turn,
+                        "skill": skill,
+                        "cluster": SKILL_TO_CLUSTER[skill],
+                        "difficulty": difficulty,
+                        "question": question,
+                        "question_quality_scores": {
+                            name: quality_scores[name]
+                            for name in QUESTION_QUALITY_DIMENSIONS
+                        },
+                        "overall_question_quality": quality_scores["overall_question_quality"],
+                        "quality_threshold": quality_threshold,
+                        "quality_threshold_met": (
+                            quality_scores["overall_question_quality"] >= quality_threshold
+                        ),
+                        "regeneration_count": regeneration_count,
+                        "question_generation_attempts": question_attempts,
+                        "answer": answer,
+                        "assigned_skill_theta": profile.skill_theta[skill],
+                        "judge_score_mean": score_mean,
+                        "judge_score_std": score_std,
+                        "judge_details": judge_details,
+                        "posterior_skill_mean": model.skill_mean(skill),
+                        "posterior_skill_std": math.sqrt(model.skill_variance(skill)),
+                        "posterior_job_mean": model.job_mean(),
+                        "posterior_job_std": math.sqrt(model.job_variance()),
+                        "selector": components,
+                    }
+                    append_jsonl(turns_path, record)
+                    grouped[(strategy, profile.candidate_id)].append(record)
+                    progress.update(1)
+                    time.sleep(max(request_delay, 0.0))
 
     candidate_rows = []
     for strategy in strategies:
@@ -1056,6 +1273,11 @@ def run_qwen(
             "controlled latent profiles, not verified human ground truth."
         ),
         "setup": {
+            "question_model": question_model,
+            "question_judge_model": question_judge_model,
+            "question_judge_repeats": question_judge_repeats,
+            "quality_threshold": quality_threshold,
+            "max_regenerations": max_regenerations,
             "candidate_model": candidate_model,
             "judge_model": judge_model,
             "judge_repeats": judge_repeats,
@@ -1094,13 +1316,17 @@ def parse_args() -> argparse.Namespace:
         default=["bridge", "uncertainty", "random", "fixed"],
     )
 
-    parser.add_argument("--api-key", default=os.environ.get("DASHSCOPE_API_KEY"))
     parser.add_argument(
         "--base-url",
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
-    parser.add_argument("--candidate-model", default=os.environ.get("QWEN_CANDIDATE_MODEL"))
-    parser.add_argument("--judge-model", default=os.environ.get("QWEN_JUDGE_MODEL"))
+    parser.add_argument("--question-model", default="qwen-turbo")
+    parser.add_argument("--question-judge-model", default="qwen-max")
+    parser.add_argument("--question-judge-repeats", type=int, default=3)
+    parser.add_argument("--quality-threshold", type=float, default=7.0)
+    parser.add_argument("--max-regenerations", type=int, default=2)
+    parser.add_argument("--candidate-model", default="qwen-max")
+    parser.add_argument("--judge-model", default="qwen-max")
     parser.add_argument("--qwen-candidates", type=int, default=30)
     parser.add_argument("--qwen-questions", type=int, default=12)
     parser.add_argument("--judge-repeats", type=int, default=3)
@@ -1139,30 +1365,45 @@ def main() -> None:
         print_compact("Exp. 2 complete", result)
 
     if args.mode == "qwen":
-        if not args.api_key or not args.candidate_model or not args.judge_model:
+        api_key = os.environ.get("DASHSCOPE_API_KEY")
+        if not api_key:
             raise SystemExit(
-                "Qwen mode requires DASHSCOPE_API_KEY, --candidate-model, and --judge-model"
+                "Qwen mode requires DASHSCOPE_API_KEY in the environment"
             )
-        if args.judge_repeats < 1:
-            raise SystemExit("--judge-repeats must be at least one")
+        if args.question_judge_repeats < 1 or args.judge_repeats < 1:
+            raise SystemExit("Judge repeat counts must be at least one")
+        if not 1.0 <= args.quality_threshold <= 10.0:
+            raise SystemExit("--quality-threshold must be within [1,10]")
+        if args.max_regenerations < 0:
+            raise SystemExit("--max-regenerations must be non-negative")
+        calls_per_turn = (
+            (args.max_regenerations + 1) * (1 + args.question_judge_repeats)
+            + 1
+            + args.judge_repeats
+        )
         estimated_calls = (
             args.qwen_candidates
             * len(args.strategies)
             * args.qwen_questions
-            * (1 + args.judge_repeats)
+            * calls_per_turn
         )
         print(f"Estimated maximum API calls: {estimated_calls}")
         if not args.confirm_api_calls:
             raise SystemExit("Re-run with --confirm-api-calls after checking the estimated cost")
         result = run_qwen(
             output_root=output_root,
-            api_key=args.api_key,
+            api_key=api_key,
             base_url=args.base_url,
+            question_model=args.question_model,
+            question_judge_model=args.question_judge_model,
             candidate_model=args.candidate_model,
             judge_model=args.judge_model,
             n_candidates=args.qwen_candidates,
             questions=args.qwen_questions,
             strategies=args.strategies,
+            question_judge_repeats=args.question_judge_repeats,
+            quality_threshold=args.quality_threshold,
+            max_regenerations=args.max_regenerations,
             judge_repeats=args.judge_repeats,
             seed=args.seed,
             request_delay=args.request_delay,
