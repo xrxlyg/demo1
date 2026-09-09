@@ -926,6 +926,44 @@ def parse_question_quality_json(raw: str) -> Dict:
     return parsed
 
 
+def request_judge_json(
+    client: QwenClient,
+    model: str,
+    system: str,
+    user: str,
+    parser,
+    max_format_attempts: int = 3,
+    max_tokens: int = 400,
+) -> Dict:
+    """Retry judge calls whose content is not valid JSON and retain bad outputs."""
+    invalid_outputs = []
+    current_user = user
+    for format_attempt in range(max_format_attempts):
+        raw = client.chat(model, system, current_user, temperature=0.2, max_tokens=max_tokens)
+        try:
+            parsed = parser(raw)
+        except (ValueError, KeyError, TypeError) as exc:
+            invalid_outputs.append({
+                "raw": raw,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            if format_attempt + 1 == max_format_attempts:
+                raise ValueError(
+                    f"Judge failed to return valid JSON after {max_format_attempts} attempts; "
+                    f"last output: {raw[:500]!r}"
+                ) from exc
+            current_user = (
+                f"{user}\n\n你上一次的输出无法解析：{raw[:1000]}\n"
+                "请重新评分。只输出严格JSON对象，不要Markdown代码块或任何额外文字。"
+            )
+            continue
+        parsed["raw"] = raw
+        parsed["format_retry_count"] = format_attempt
+        parsed["invalid_raw_outputs"] = invalid_outputs
+        return parsed
+    raise RuntimeError("unreachable")
+
+
 def evaluate_qwen_question(
     client: QwenClient,
     model: str,
@@ -956,10 +994,14 @@ def evaluate_qwen_question(
     )
     details = []
     for _ in range(repeats):
-        raw = client.chat(model, system, user, temperature=0.2, max_tokens=400)
-        parsed = parse_question_quality_json(raw)
-        parsed["raw"] = raw
-        details.append(parsed)
+        details.append(request_judge_json(
+            client=client,
+            model=model,
+            system=system,
+            user=user,
+            parser=parse_question_quality_json,
+            max_tokens=400,
+        ))
     score_names = (*QUESTION_QUALITY_DIMENSIONS, "overall_question_quality")
     means = {
         name: sum(row[name] for row in details) / len(details)
@@ -1064,10 +1106,14 @@ def evaluate_qwen_answer(
     user = f"技能：{skill}\n问题：{question}\n回答：{answer}"
     details = []
     for _ in range(repeats):
-        raw = client.chat(model, system, user, temperature=0.2, max_tokens=240)
-        parsed = parse_score_json(raw)
-        parsed["raw"] = raw
-        details.append(parsed)
+        details.append(request_judge_json(
+            client=client,
+            model=model,
+            system=system,
+            user=user,
+            parser=parse_score_json,
+            max_tokens=240,
+        ))
     scores = [row["score"] for row in details]
     score_std = statistics.stdev(scores) if len(scores) > 1 else 0.0
     return sum(scores) / len(scores), score_std, details
@@ -1387,7 +1433,7 @@ def main() -> None:
             * args.qwen_questions
             * calls_per_turn
         )
-        print(f"Estimated maximum API calls: {estimated_calls}")
+        print(f"Estimated planned API calls (excluding network/format retries): {estimated_calls}")
         if not args.confirm_api_calls:
             raise SystemExit("Re-run with --confirm-api-calls after checking the estimated cost")
         result = run_qwen(
