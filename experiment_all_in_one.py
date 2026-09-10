@@ -259,6 +259,66 @@ JOB_WEIGHTS = {
     for skill in skills
 }
 
+
+JOB_DOMAIN_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "uniform": {domain: 1.0 / len(CLUSTERS) for domain in CLUSTERS},
+    "backend": {
+        "Programming": 0.18,
+        "Database and Storage": 0.18,
+        "Distributed Systems": 0.16,
+        "Middleware and Messaging": 0.15,
+        "Cloud and DevOps": 0.08,
+        "System Design": 0.15,
+        "Security": 0.05,
+        "Software Engineering Practice": 0.03,
+        "Testing and Reliability": 0.02,
+    },
+    "cloud_sre": {
+        "Programming": 0.08,
+        "Database and Storage": 0.08,
+        "Distributed Systems": 0.14,
+        "Middleware and Messaging": 0.10,
+        "Cloud and DevOps": 0.24,
+        "System Design": 0.14,
+        "Security": 0.09,
+        "Software Engineering Practice": 0.04,
+        "Testing and Reliability": 0.09,
+    },
+    "distributed_systems": {
+        "Programming": 0.12,
+        "Database and Storage": 0.12,
+        "Distributed Systems": 0.28,
+        "Middleware and Messaging": 0.15,
+        "Cloud and DevOps": 0.08,
+        "System Design": 0.15,
+        "Security": 0.04,
+        "Software Engineering Practice": 0.02,
+        "Testing and Reliability": 0.04,
+    },
+}
+
+
+def job_weights_for(profile_name: str = "uniform") -> Dict[str, float]:
+    """Expand preregistered domain weights to normalized leaf-skill weights."""
+    if profile_name not in JOB_DOMAIN_WEIGHTS:
+        raise KeyError(f"Unknown job profile: {profile_name}")
+    domain_weights = JOB_DOMAIN_WEIGHTS[profile_name]
+    if set(domain_weights) != set(CLUSTERS):
+        raise ValueError(f"Job profile {profile_name!r} does not cover every domain")
+    total = sum(domain_weights.values())
+    if total <= 0:
+        raise ValueError("Job weights must sum to a positive value")
+    return {
+        skill: domain_weights[domain] / total / len(SKILL_CLUSTERS[domain])
+        for domain in CLUSTERS
+        for skill in SKILL_CLUSTERS[domain]
+    }
+
+
+JOB_WEIGHT_PROFILES = {
+    name: job_weights_for(name) for name in JOB_DOMAIN_WEIGHTS
+}
+
 DIFFICULTY_TARGET = {"easy": 3.0, "medium": 5.5, "hard": 8.0}
 EXP1_SKILLS = [
     "Java", "SQL Indexing", "CAP Trade-offs", "Kubernetes",
@@ -441,7 +501,50 @@ def balanced_levels(n_candidates: int) -> List[str]:
     return ["junior"] * per_level + ["mid"] * per_level + ["senior"] * per_level
 
 
-def generate_profiles(n_candidates: int, seed: int) -> List[CandidateProfile]:
+PROFILE_REGIMES = (
+    "hierarchical", "weak_hierarchy", "flat_correlated", "independent",
+    "shuffled_tree",
+)
+
+
+def _aggregate_internal_truth(skill_theta: Mapping[str, float]) -> Dict[str, float]:
+    """Create descriptive internal-node truth from descendant leaf abilities."""
+    node_theta: Dict[str, float] = {
+        SKILL_TO_NODE[skill]: float(value) for skill, value in skill_theta.items()
+    }
+    domain_values = []
+    for domain, branches in CAPABILITY_TREE.items():
+        domain_id = next(
+            node.node_id for node in CAPABILITY_NODES
+            if node.level == 1 and node.label == domain
+        )
+        branch_values = []
+        for branch, skills in branches.items():
+            branch_id = next(
+                node.node_id for node in CAPABILITY_NODES
+                if node.level == 2 and node.label == branch
+                and node.parent_id == domain_id
+            )
+            value = sum(skill_theta[skill] for skill in skills) / len(skills)
+            node_theta[branch_id] = value
+            branch_values.append(value)
+        domain_value = sum(branch_values) / len(branch_values)
+        node_theta[domain_id] = domain_value
+        domain_values.append(domain_value)
+    node_theta[ROOT_NODE] = sum(domain_values) / len(domain_values)
+    return node_theta
+
+
+def generate_profiles(
+    n_candidates: int,
+    seed: int,
+    regime: str = "hierarchical",
+    misspecification_rate: float = 0.0,
+) -> List[CandidateProfile]:
+    if regime not in PROFILE_REGIMES:
+        raise ValueError(f"regime must be one of {PROFILE_REGIMES}, got {regime!r}")
+    if not 0.0 <= misspecification_rate <= 1.0:
+        raise ValueError("misspecification_rate must be within [0, 1]")
     rng = random.Random(seed)
     levels = balanced_levels(n_candidates)
     rng.shuffle(levels)
@@ -450,28 +553,67 @@ def generate_profiles(n_candidates: int, seed: int) -> List[CandidateProfile]:
         config = LEVEL_CONFIG[level]
         global_theta = clip(rng.gauss(config["mean"], config["std"]))
         strong = sorted(rng.sample(CLUSTERS, config["strong"]))
-        node_theta = {ROOT_NODE: global_theta}
-        skill_theta = {}
-        for domain, branches in CAPABILITY_TREE.items():
-            domain_id = next(
-                node.node_id for node in CAPABILITY_NODES
-                if node.level == 1 and node.label == domain
-            )
-            domain_shift = 0.75 if domain in strong else -0.35
-            domain_theta = clip(global_theta + domain_shift + rng.gauss(0.0, 0.30))
-            node_theta[domain_id] = domain_theta
-            for branch, skills in branches.items():
-                branch_id = next(
-                    node.node_id for node in CAPABILITY_NODES
-                    if node.level == 2 and node.label == branch
-                    and node.parent_id == domain_id
+        node_theta: Dict[str, float] = {ROOT_NODE: global_theta}
+        skill_theta: Dict[str, float] = {}
+        if regime in ("hierarchical", "weak_hierarchy", "shuffled_tree"):
+            if regime == "weak_hierarchy":
+                domain_std, branch_std, leaf_std, strong_bonus, weak_penalty = (
+                    0.65, 0.85, 1.25, 0.40, -0.20,
                 )
-                branch_theta = clip(domain_theta + rng.gauss(0.0, 0.40))
-                node_theta[branch_id] = branch_theta
-                for skill in skills:
-                    value = clip(branch_theta + rng.gauss(0.0, 0.50))
+            else:
+                domain_std, branch_std, leaf_std, strong_bonus, weak_penalty = (
+                    0.30, 0.40, 0.50, 0.75, -0.35,
+                )
+            for domain, branches in CAPABILITY_TREE.items():
+                domain_id = next(
+                    node.node_id for node in CAPABILITY_NODES
+                    if node.level == 1 and node.label == domain
+                )
+                domain_shift = strong_bonus if domain in strong else weak_penalty
+                domain_theta = clip(global_theta + domain_shift + rng.gauss(0.0, domain_std))
+                node_theta[domain_id] = domain_theta
+                for branch, skills in branches.items():
+                    branch_id = next(
+                        node.node_id for node in CAPABILITY_NODES
+                        if node.level == 2 and node.label == branch
+                        and node.parent_id == domain_id
+                    )
+                    branch_theta = clip(domain_theta + rng.gauss(0.0, branch_std))
+                    node_theta[branch_id] = branch_theta
+                    for skill in skills:
+                        value = clip(branch_theta + rng.gauss(0.0, leaf_std))
+                        skill_theta[skill] = value
+                        node_theta[SKILL_TO_NODE[skill]] = value
+            if regime == "shuffled_tree":
+                rate = misspecification_rate if misspecification_rate > 0 else 0.20
+                count = max(2, int(round(rate * len(SKILLS))))
+                selected = rng.sample(SKILLS, min(count, len(SKILLS)))
+                values = [skill_theta[skill] for skill in selected]
+                values = values[1:] + values[:1]
+                for skill, value in zip(selected, values):
                     skill_theta[skill] = value
                     node_theta[SKILL_TO_NODE[skill]] = value
+        elif regime == "flat_correlated":
+            common = rng.gauss(0.0, 0.35)
+            branch_factors = {
+                (domain, branch): rng.gauss(0.0, 0.75)
+                for domain, branches in CAPABILITY_TREE.items()
+                for branch in branches
+            }
+            for domain, branches in CAPABILITY_TREE.items():
+                domain_shift = 0.45 if domain in strong else -0.20
+                for branch, skills in branches.items():
+                    shared = branch_factors[(domain, branch)]
+                    for skill in skills:
+                        skill_theta[skill] = clip(
+                            global_theta + common + domain_shift
+                            + shared + rng.gauss(0.0, 0.85)
+                        )
+            node_theta = _aggregate_internal_truth(skill_theta)
+        else:  # independent
+            for skill in SKILLS:
+                skill_theta[skill] = clip(rng.gauss(config["mean"], 1.35))
+            node_theta = _aggregate_internal_truth(skill_theta)
         profiles.append(CandidateProfile(
             candidate_id=candidate_id,
             level=level,
@@ -484,8 +626,12 @@ def generate_profiles(n_candidates: int, seed: int) -> List[CandidateProfile]:
     return profiles
 
 
-def true_job_score(profile: CandidateProfile) -> float:
-    return sum(JOB_WEIGHTS[skill] * profile.skill_theta[skill] for skill in SKILLS)
+def true_job_score(
+    profile: CandidateProfile,
+    job_weights: Optional[Mapping[str, float]] = None,
+) -> float:
+    weights = JOB_WEIGHTS if job_weights is None else job_weights
+    return sum(weights[skill] * profile.skill_theta[skill] for skill in SKILLS)
 
 
 def simulate_score(
@@ -519,7 +665,7 @@ class BayesianAbilityModel:
     standard Gaussian conditioning over the full node covariance matrix.
     """
 
-    MODES = ("tree", "flat", "independent")
+    MODES = ("tree", "matched_flat", "flat", "independent")
 
     def __init__(
         self,
@@ -532,6 +678,9 @@ class BayesianAbilityModel:
         graph_length_scale: float = 1.5,
         root_std: float = 1.5,
         inheritance_stds: Sequence[float] = (1.2, 1.0, 1.1),
+        job_weights: Optional[Mapping[str, float]] = None,
+        objective_weights: Sequence[float] = (0.55, 0.25, 0.20),
+        repeat_penalty: float = 0.15,
     ) -> None:
         if graph_enabled is not None:
             propagation = "tree" if graph_enabled else "independent"
@@ -539,6 +688,10 @@ class BayesianAbilityModel:
             raise ValueError(f"propagation must be one of {self.MODES}, got {propagation!r}")
         if len(inheritance_stds) != 3:
             raise ValueError("inheritance_stds must contain L1, L2, and leaf standard deviations")
+        if len(objective_weights) != 3 or any(value < 0 for value in objective_weights):
+            raise ValueError("objective_weights must contain three non-negative values")
+        if repeat_penalty < 0:
+            raise ValueError("repeat_penalty must be non-negative")
         self.propagation = propagation
         self.skills = list(SKILLS)
         self.nodes = (
@@ -552,6 +705,17 @@ class BayesianAbilityModel:
         self.default_observation_variance = observation_std ** 2
         self.root_std = float(root_std)
         self.inheritance_stds = tuple(float(value) for value in inheritance_stds)
+        raw_job_weights = JOB_WEIGHTS if job_weights is None else dict(job_weights)
+        if set(raw_job_weights) != set(SKILLS):
+            raise ValueError("job_weights must contain every leaf skill exactly once")
+        job_weight_total = sum(float(value) for value in raw_job_weights.values())
+        if job_weight_total <= 0:
+            raise ValueError("job_weights must sum to a positive value")
+        self.job_weights = {
+            skill: float(raw_job_weights[skill]) / job_weight_total for skill in SKILLS
+        }
+        self.objective_weights = tuple(float(value) for value in objective_weights)
+        self.repeat_penalty = float(repeat_penalty)
         self.covariance = [[0.0] * len(self.nodes) for _ in self.nodes]
         if propagation == "tree":
             innovation_variance = {
@@ -580,7 +744,20 @@ class BayesianAbilityModel:
                 first = NODE_BY_ID[first_id].label
                 for j, second_id in enumerate(self.nodes):
                     second = NODE_BY_ID[second_id].label
-                    if i == j:
+                    if propagation == "matched_flat":
+                        innovation_variance = {
+                            0: self.root_std ** 2,
+                            1: self.inheritance_stds[0] ** 2,
+                            2: self.inheritance_stds[1] ** 2,
+                            3: self.inheritance_stds[2] ** 2,
+                        }
+                        first_ancestors = set(self._ancestor_ids(first_id, include_self=True))
+                        second_ancestors = set(self._ancestor_ids(second_id, include_self=True))
+                        value = sum(
+                            innovation_variance[NODE_BY_ID[node_id].level]
+                            for node_id in first_ancestors & second_ancestors
+                        )
+                    elif i == j:
                         value = prior_variance
                     elif propagation == "flat":
                         if SKILL_TO_BRANCH[first] == SKILL_TO_BRANCH[second]:
@@ -685,13 +862,19 @@ class BayesianAbilityModel:
         self.observations[skill] += 1
 
     def job_mean(self) -> float:
-        return sum(JOB_WEIGHTS[skill] * self.skill_mean(skill) for skill in SKILLS)
+        return self.weighted_job_mean(self.job_weights)
+
+    def weighted_job_mean(self, weights: Mapping[str, float]) -> float:
+        return sum(float(weights[skill]) * self.skill_mean(skill) for skill in SKILLS)
 
     def job_variance(self) -> float:
+        return self.weighted_job_variance(self.job_weights)
+
+    def weighted_job_variance(self, weights: Mapping[str, float]) -> float:
         total = 0.0
-        for first, wf in JOB_WEIGHTS.items():
+        for first, wf in weights.items():
             i = self._skill_index(first)
-            for second, ws in JOB_WEIGHTS.items():
+            for second, ws in weights.items():
                 j = self._skill_index(second)
                 total += wf * ws * self.covariance[i][j]
         return max(total, 0.0)
@@ -718,7 +901,7 @@ class BayesianAbilityModel:
         j = self._skill_index(skill)
         denominator = self.covariance[j][j] + observation_variance
         covariance_with_job = sum(
-            JOB_WEIGHTS[name] * self.covariance[self._skill_index(name)][j]
+            self.job_weights[name] * self.covariance[self._skill_index(name)][j]
             for name in SKILLS
         )
         decision_reduction = covariance_with_job ** 2 / max(denominator, _EPS)
@@ -740,11 +923,12 @@ class BayesianAbilityModel:
         hierarchy_variance = self.hierarchy_variance(skill)
         relative_hierarchy = hierarchy_reduction / max(hierarchy_variance, _EPS)
         repeat_count = sum(1 for name in recent if name == skill)
-        question_cost = 1.0 + 0.15 * repeat_count
+        question_cost = 1.0 + self.repeat_penalty * repeat_count
+        lambda_decision, lambda_global, lambda_hierarchy = self.objective_weights
         utility = (
-            0.55 * relative_decision
-            + 0.25 * relative_global
-            + 0.20 * relative_hierarchy
+            lambda_decision * relative_decision
+            + lambda_global * relative_global
+            + lambda_hierarchy * relative_hierarchy
         ) / question_cost
         return {
             "utility": utility,
@@ -757,6 +941,10 @@ class BayesianAbilityModel:
             "difficulty_efficiency": efficiency,
             "observation_std": math.sqrt(observation_variance),
             "question_cost": question_cost,
+            "lambda_decision": lambda_decision,
+            "lambda_global": lambda_global,
+            "lambda_hierarchy": lambda_hierarchy,
+            "repeat_penalty": self.repeat_penalty,
             "propagation": self.propagation,
         }
 
@@ -771,9 +959,25 @@ STRATEGY_SPECS = {
     "random": ("tree", "random"),
     "tree_random": ("tree", "random"),
     "flat_bridge": ("flat", "bridge"),
+    "matched_flat_bridge": ("matched_flat", "bridge"),
     "independent_bridge": ("independent", "bridge"),
     "uncertainty": ("tree", "uncertainty"),
+    "tree_uncertainty": ("tree", "uncertainty"),
     "fixed": ("tree", "fixed"),
+    "tree_fixed": ("tree", "fixed"),
+    "tree_bridge_no_job": ("tree", "bridge"),
+    "tree_bridge_no_global": ("tree", "bridge"),
+    "tree_bridge_no_hierarchy": ("tree", "bridge"),
+    "tree_bridge_no_repeat": ("tree", "bridge"),
+    "tree_bridge_uniform_job": ("tree", "bridge"),
+}
+
+
+STRATEGY_MODEL_OPTIONS: Dict[str, Dict[str, object]] = {
+    "tree_bridge_no_job": {"objective_weights": (0.0, 0.25, 0.20)},
+    "tree_bridge_no_global": {"objective_weights": (0.55, 0.0, 0.20)},
+    "tree_bridge_no_hierarchy": {"objective_weights": (0.55, 0.25, 0.0)},
+    "tree_bridge_no_repeat": {"repeat_penalty": 0.0},
 }
 
 
@@ -948,14 +1152,64 @@ def decision_accuracy(truth: Sequence[float], prediction: Sequence[float], thres
     return correct / len(truth)
 
 
+def binary_decision_metrics(
+    truth: Sequence[float],
+    prediction: Sequence[float],
+    probabilities: Optional[Sequence[float]] = None,
+    threshold: float = 6.5,
+) -> Dict[str, float]:
+    actual = [value >= threshold for value in truth]
+    predicted = [value >= threshold for value in prediction]
+    tp = sum(a and p for a, p in zip(actual, predicted))
+    tn = sum((not a) and (not p) for a, p in zip(actual, predicted))
+    fp = sum((not a) and p for a, p in zip(actual, predicted))
+    fn = sum(a and (not p) for a, p in zip(actual, predicted))
+    sensitivity = tp / (tp + fn) if tp + fn else float("nan")
+    specificity = tn / (tn + fp) if tn + fp else float("nan")
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
+    scores = list(prediction if probabilities is None else probabilities)
+    positive_scores = [score for score, label in zip(scores, actual) if label]
+    negative_scores = [score for score, label in zip(scores, actual) if not label]
+    if positive_scores and negative_scores:
+        auc = sum(
+            1.0 if positive > negative else 0.5 if positive == negative else 0.0
+            for positive in positive_scores for negative in negative_scores
+        ) / (len(positive_scores) * len(negative_scores))
+    else:
+        auc = float("nan")
+    return {
+        "decision_accuracy": (tp + tn) / len(actual),
+        "balanced_accuracy": (
+            0.5 * (sensitivity + specificity)
+            if not math.isnan(sensitivity) and not math.isnan(specificity)
+            else float("nan")
+        ),
+        "f1": f1,
+        "auroc": auc,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+    }
+
+
 def strategy_for_candidate(
     profile: CandidateProfile,
     strategy: str,
     questions: int,
     seed: int,
+    job_profile: str = "uniform",
+    decision_threshold: float = 6.5,
 ) -> Dict:
     propagation, _policy = strategy_spec(strategy)
-    model = BayesianAbilityModel(propagation=propagation)
+    job_weights = JOB_WEIGHT_PROFILES[job_profile]
+    selection_job_profile = "uniform" if strategy == "tree_bridge_uniform_job" else job_profile
+    selection_job_weights = JOB_WEIGHT_PROFILES[selection_job_profile]
+    model = BayesianAbilityModel(
+        propagation=propagation,
+        job_weights=selection_job_weights,
+        **STRATEGY_MODEL_OPTIONS.get(strategy, {}),
+    )
     recent: List[str] = []
     per_skill_count = defaultdict(int)
     trace = []
@@ -973,6 +1227,9 @@ def strategy_for_candidate(
         per_skill_count[skill] += 1
         model.update(skill, score, observation_std=observation_std)
         recent = (recent + [skill])[-6:]
+        truth_job = true_job_score(profile, job_weights)
+        posterior_job_mean = model.weighted_job_mean(job_weights)
+        posterior_job_std = math.sqrt(model.weighted_job_variance(job_weights))
         trace.append({
             "turn": turn + 1,
             "skill": skill,
@@ -981,26 +1238,63 @@ def strategy_for_candidate(
             "capability_path": list(SKILL_PATHS[skill]),
             "difficulty": difficulty,
             "score": score,
-            "posterior_job_mean": model.job_mean(),
-            "posterior_job_std": math.sqrt(model.job_variance()),
+            "posterior_job_mean": posterior_job_mean,
+            "posterior_job_std": posterior_job_std,
+            "absolute_job_error": abs(posterior_job_mean - truth_job),
+            "decision_correct": float(
+                (posterior_job_mean >= decision_threshold)
+                == (truth_job >= decision_threshold)
+            ),
             **components,
         })
 
     observed_skills = {row["skill"] for row in trace}
     observed_clusters = {row["cluster"] for row in trace}
-    truth = true_job_score(profile)
-    prediction = model.job_mean()
+    truth = true_job_score(profile, job_weights)
+    prediction = model.weighted_job_mean(job_weights)
+    leaf_errors = [model.skill_mean(skill) - profile.skill_theta[skill] for skill in SKILLS]
+    internal_node_errors = [
+        model.node_mean(node.node_id) - profile.node_theta[node.node_id]
+        for node in CAPABILITY_NODES if not node.is_leaf and node.node_id in model.index
+    ]
+    posterior_variance = model.weighted_job_variance(job_weights)
+    posterior_std = math.sqrt(posterior_variance)
+    pass_probability = 0.5 * (
+        1.0 + math.erf((prediction - decision_threshold) / max(posterior_std * math.sqrt(2.0), _EPS))
+    )
+    true_pass = float(truth >= decision_threshold)
+    first_mae_half_turn = next(
+        (row["turn"] for row in trace if row["absolute_job_error"] <= 0.5),
+        questions + 1,
+    )
     return {
         "candidate_id": profile.candidate_id,
         "level": profile.level,
         "strategy": strategy,
         "propagation": propagation,
+        "job_profile": job_profile,
+        "selection_job_profile": selection_job_profile,
         "true_job_score": truth,
         "estimated_job_score": prediction,
         "absolute_error": abs(prediction - truth),
         "skill_coverage": len(observed_skills) / len(SKILLS),
         "cluster_coverage": len(observed_clusters) / len(CLUSTERS),
-        "posterior_job_std": math.sqrt(model.job_variance()),
+        "posterior_job_std": posterior_std,
+        "leaf_mae": sum(abs(error) for error in leaf_errors) / len(leaf_errors),
+        "leaf_rmse": math.sqrt(sum(error * error for error in leaf_errors) / len(leaf_errors)),
+        "internal_node_mae": (
+            sum(abs(error) for error in internal_node_errors) / len(internal_node_errors)
+            if internal_node_errors else float("nan")
+        ),
+        "job_95_coverage": float(abs(truth - prediction) <= 1.96 * posterior_std),
+        "job_nll": (
+            0.5 * math.log(2.0 * math.pi * max(posterior_variance, _EPS))
+            + 0.5 * (truth - prediction) ** 2 / max(posterior_variance, _EPS)
+        ),
+        "pass_probability": pass_probability,
+        "brier_score": (pass_probability - true_pass) ** 2,
+        "first_turn_job_mae_le_0_5": first_mae_half_turn,
+        "reached_job_mae_le_0_5": float(first_mae_half_turn <= questions),
         "trace": trace,
     }
 
@@ -1019,6 +1313,43 @@ def paired_sign_flip_p(differences: Sequence[float], samples: int = 20000, seed:
     return (exceed + 1) / (samples + 1)
 
 
+def bootstrap_mean_ci(
+    values: Sequence[float], repeats: int = 10000, seed: int = 42
+) -> Tuple[float, float]:
+    if not values:
+        return float("nan"), float("nan")
+    rng = random.Random(seed)
+    boot = sorted(
+        sum(rng.choice(values) for _ in values) / len(values)
+        for _ in range(repeats)
+    )
+    return (
+        boot[max(0, int(0.025 * (len(boot) - 1)))],
+        boot[min(len(boot) - 1, int(0.975 * (len(boot) - 1)))],
+    )
+
+
+def paired_difference_summary(
+    differences: Sequence[float], seed: int, positive_interpretation: str
+) -> Dict[str, object]:
+    values = [float(value) for value in differences]
+    ci_low, ci_high = bootstrap_mean_ci(values, seed=seed)
+    std = statistics.stdev(values) if len(values) > 1 else 0.0
+    mean_difference = sum(values) / len(values) if values else float("nan")
+    return {
+        "n_pairs": len(values),
+        "mean_difference": mean_difference,
+        "bootstrap_95_ci_low": ci_low,
+        "bootstrap_95_ci_high": ci_high,
+        "paired_effect_size_dz": mean_difference / std if std > 0 else 0.0,
+        "positive_win_rate": sum(value > _EPS for value in values) / len(values),
+        "tie_rate": sum(abs(value) <= _EPS for value in values) / len(values),
+        "negative_loss_rate": sum(value < -_EPS for value in values) / len(values),
+        "paired_sign_flip_p": paired_sign_flip_p(values, seed=seed),
+        "positive_interpretation": positive_interpretation,
+    }
+
+
 def run_exp2(
     output_root: Path,
     seeds: int,
@@ -1026,45 +1357,86 @@ def run_exp2(
     questions: int,
     strategies: Sequence[str],
     base_seed: int,
+    job_profile: str = "uniform",
+    profile_regime: str = "hierarchical",
+    misspecification_rate: float = 0.0,
+    experiment_dir: str = "exp2_selection",
 ) -> Dict:
-    output_dir = output_root / "exp2_selection"
+    output_dir = output_root / experiment_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     seed_metrics = []
     all_candidate_rows = []
+    all_trace_rows = []
 
     for offset in range(seeds):
         seed = base_seed + offset
-        profiles = generate_profiles(n_candidates, seed)
+        profiles = generate_profiles(
+            n_candidates, seed, regime=profile_regime,
+            misspecification_rate=misspecification_rate,
+        )
         for strategy in strategies:
             results = [
-                strategy_for_candidate(profile, strategy, questions, seed)
+                strategy_for_candidate(
+                    profile, strategy, questions, seed, job_profile=job_profile,
+                )
                 for profile in profiles
             ]
             truth = [row["true_job_score"] for row in results]
             prediction = [row["estimated_job_score"] for row in results]
             metrics = regression_metrics(truth, prediction)
+            decision_metrics = binary_decision_metrics(
+                truth, prediction, [row["pass_probability"] for row in results],
+            )
             metrics.update({
                 "seed": seed,
                 "strategy": strategy,
-                "decision_accuracy": decision_accuracy(truth, prediction),
+                **decision_metrics,
                 "skill_coverage": sum(row["skill_coverage"] for row in results) / len(results),
                 "cluster_coverage": sum(row["cluster_coverage"] for row in results) / len(results),
                 "posterior_job_std": sum(row["posterior_job_std"] for row in results) / len(results),
+                "leaf_mae": sum(row["leaf_mae"] for row in results) / len(results),
+                "leaf_rmse": sum(row["leaf_rmse"] for row in results) / len(results),
+                "job_95_coverage": sum(row["job_95_coverage"] for row in results) / len(results),
+                "job_nll": sum(row["job_nll"] for row in results) / len(results),
+                "brier_score": sum(row["brier_score"] for row in results) / len(results),
+                "first_turn_job_mae_le_0_5": sum(
+                    row["first_turn_job_mae_le_0_5"] for row in results
+                ) / len(results),
+                "reached_job_mae_le_0_5": sum(
+                    row["reached_job_mae_le_0_5"] for row in results
+                ) / len(results),
             })
             seed_metrics.append(metrics)
             for row in results:
                 compact = {key: value for key, value in row.items() if key != "trace"}
                 compact["seed"] = seed
                 all_candidate_rows.append(compact)
+                for trace_row in row["trace"]:
+                    all_trace_rows.append({
+                        "seed": seed,
+                        "candidate_id": row["candidate_id"],
+                        "level": row["level"],
+                        "strategy": strategy,
+                        "profile_regime": profile_regime,
+                        "job_profile": job_profile,
+                        **trace_row,
+                    })
 
     summary = {}
     for strategy in strategies:
         rows = [row for row in seed_metrics if row["strategy"] == strategy]
         summary[strategy] = {
-            metric: mean_std([float(row[metric]) for row in rows])
+            metric: mean_std([
+                float(row[metric]) for row in rows
+                if not math.isnan(float(row[metric]))
+            ])
             for metric in (
                 "mae", "rmse", "pearson", "spearman", "decision_accuracy",
+                "balanced_accuracy", "f1", "auroc", "sensitivity", "specificity",
                 "skill_coverage", "cluster_coverage", "posterior_job_std",
+                "leaf_mae", "leaf_rmse", "job_95_coverage", "job_nll",
+                "brier_score", "first_turn_job_mae_le_0_5",
+                "reached_job_mae_le_0_5",
             )
         }
 
@@ -1084,6 +1456,22 @@ def run_exp2(
             }
             common = sorted(set(bridge_by_seed) & set(baseline_by_seed))
             differences = [baseline_by_seed[s] - bridge_by_seed[s] for s in common]
+            candidate_by_key = {
+                (row["seed"], row["candidate_id"], row["strategy"]): row
+                for row in all_candidate_rows
+            }
+            common_candidates = sorted({
+                (row["seed"], row["candidate_id"])
+                for row in all_candidate_rows if row["strategy"] == bridge_name
+            } & {
+                (row["seed"], row["candidate_id"])
+                for row in all_candidate_rows if row["strategy"] == baseline
+            })
+            candidate_differences = [
+                candidate_by_key[(seed_value, candidate_id, baseline)]["absolute_error"]
+                - candidate_by_key[(seed_value, candidate_id, bridge_name)]["absolute_error"]
+                for seed_value, candidate_id in common_candidates
+            ]
             comparisons[f"{bridge_name}_vs_{baseline}"] = {
                 "positive_means_bridge_lower_mae": True,
                 "mean_mae_improvement": sum(differences) / len(differences),
@@ -1091,7 +1479,31 @@ def run_exp2(
                     differences,
                     seed=stable_seed("sign-flip", baseline, base_seed),
                 ),
+                "candidate_level_mae": paired_difference_summary(
+                    candidate_differences,
+                    seed=stable_seed("candidate-bootstrap", baseline, base_seed),
+                    positive_interpretation=f"{bridge_name} has lower absolute job-score error",
+                ),
             }
+
+    learning_curve = []
+    for strategy in strategies:
+        for turn in range(1, questions + 1):
+            rows = [
+                row for row in all_trace_rows
+                if row["strategy"] == strategy and row["turn"] == turn
+            ]
+            learning_curve.append({
+                "strategy": strategy,
+                "turn": turn,
+                "n_seed_candidates": len(rows),
+                "job_mae": sum(row["absolute_job_error"] for row in rows) / len(rows),
+                "decision_accuracy": sum(row["decision_correct"] for row in rows) / len(rows),
+                "posterior_job_std": sum(row["posterior_job_std"] for row in rows) / len(rows),
+                "mean_decision_reduction": sum(row["decision_reduction"] for row in rows) / len(rows),
+                "mean_global_reduction": sum(row["global_reduction"] for row in rows) / len(rows),
+                "mean_hierarchy_reduction": sum(row["hierarchy_reduction"] for row in rows) / len(rows),
+            })
 
     result = {
         "setup": {
@@ -1099,13 +1511,386 @@ def run_exp2(
             "candidates_per_seed": n_candidates,
             "questions": questions,
             "strategies": list(strategies),
+            "profile_regime": profile_regime,
+            "misspecification_rate": misspecification_rate,
+            "job_profile": job_profile,
+            "coverage_guard": False,
         },
         "summary": summary,
         "comparisons": comparisons,
+        "learning_curve": learning_curve,
     }
     write_csv(output_dir / "seed_metrics.csv", seed_metrics)
     write_csv(output_dir / "candidate_results.csv", all_candidate_rows)
+    write_csv(output_dir / "turn_traces.csv", all_trace_rows)
+    write_csv(output_dir / "learning_curve.csv", learning_curve)
     atomic_json(output_dir / "summary.json", result)
+    return result
+
+
+# =============================================================================
+# Publication experiments: calibrated estimation and controlled ablations
+# =============================================================================
+
+ESTIMATOR_METHODS = (
+    "single_eval", "running_mean", "ewa", "tree", "matched_flat", "flat",
+    "independent",
+)
+
+
+def _prediction_map(
+    method: str,
+    models: Mapping[str, BayesianAbilityModel],
+    last: Mapping[str, float],
+    running_sum: Mapping[str, float],
+    counts: Mapping[str, int],
+    ewa: Mapping[str, float],
+) -> Dict[str, float]:
+    if method in models:
+        return {skill: models[method].skill_mean(skill) for skill in SKILLS}
+    if method == "single_eval":
+        return {skill: float(last.get(skill, 5.0)) for skill in SKILLS}
+    if method == "running_mean":
+        return {
+            skill: (
+                float(running_sum[skill]) / int(counts[skill])
+                if counts.get(skill, 0) else 5.0
+            )
+            for skill in SKILLS
+        }
+    if method == "ewa":
+        return {skill: float(ewa.get(skill, 5.0)) for skill in SKILLS}
+    raise KeyError(method)
+
+
+def run_estimator_benchmark(
+    output_root: Path,
+    seeds: int,
+    n_candidates: int,
+    questions: int,
+    base_seed: int,
+    regimes: Sequence[str],
+    job_profile: str = "uniform",
+) -> Dict:
+    """Compare estimators on identical observations and report calibration."""
+    output_dir = output_root / "exp_estimator_benchmark"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    weights = JOB_WEIGHT_PROFILES[job_profile]
+    checkpoints = sorted({value for value in (1, 3, 6, 9, 12, questions) if value <= questions})
+    candidate_rows: List[Dict[str, object]] = []
+    observation_rows: List[Dict[str, object]] = []
+
+    for regime in regimes:
+        for offset in range(seeds):
+            seed = base_seed + offset
+            profiles = generate_profiles(n_candidates, seed, regime=regime)
+            for profile in profiles:
+                models = {
+                    mode: BayesianAbilityModel(propagation=mode, job_weights=weights)
+                    for mode in ("tree", "matched_flat", "flat", "independent")
+                }
+                last: Dict[str, float] = {}
+                running_sum: Dict[str, float] = defaultdict(float)
+                counts: Dict[str, int] = defaultdict(int)
+                ewa: Dict[str, float] = {}
+                observation_count: Dict[str, int] = defaultdict(int)
+                for turn in range(1, questions + 1):
+                    skill = FIXED_ORDER[(turn - 1) % len(FIXED_ORDER)]
+                    difficulty = ("easy", "medium", "hard")[(turn - 1) % 3]
+                    score, observation_std = simulate_score(
+                        profile, skill, difficulty, observation_count[skill], seed,
+                    )
+                    observation_count[skill] += 1
+                    last[skill] = score
+                    counts[skill] += 1
+                    running_sum[skill] += score
+                    ewa[skill] = score if skill not in ewa else 0.3 * score + 0.7 * ewa[skill]
+                    for model in models.values():
+                        model.update(skill, score, observation_std=observation_std)
+                    observation_rows.append({
+                        "regime": regime,
+                        "seed": seed,
+                        "candidate_id": profile.candidate_id,
+                        "level": profile.level,
+                        "turn": turn,
+                        "skill": skill,
+                        "difficulty": difficulty,
+                        "true_theta": profile.skill_theta[skill],
+                        "observed_score": score,
+                        "observation_std": observation_std,
+                    })
+                    if turn not in checkpoints:
+                        continue
+
+                    truth_job = true_job_score(profile, weights)
+                    true_pass = float(truth_job >= 6.5)
+                    for method in ESTIMATOR_METHODS:
+                        predictions = _prediction_map(
+                            method, models, last, running_sum, counts, ewa,
+                        )
+                        leaf_errors = [
+                            predictions[skill_name] - profile.skill_theta[skill_name]
+                            for skill_name in SKILLS
+                        ]
+                        predicted_job = sum(
+                            weights[skill_name] * predictions[skill_name]
+                            for skill_name in SKILLS
+                        )
+                        model = models.get(method)
+                        if model is not None:
+                            job_variance = model.weighted_job_variance(weights)
+                            job_std = math.sqrt(job_variance)
+                            pass_probability = 0.5 * (
+                                1.0 + math.erf(
+                                    (predicted_job - 6.5)
+                                    / max(job_std * math.sqrt(2.0), _EPS)
+                                )
+                            )
+                            leaf_coverage = sum(
+                                abs(profile.skill_theta[skill_name] - predictions[skill_name])
+                                <= 1.96 * math.sqrt(model.skill_variance(skill_name))
+                                for skill_name in SKILLS
+                            ) / len(SKILLS)
+                            leaf_nll = sum(
+                                0.5 * math.log(
+                                    2.0 * math.pi * max(model.skill_variance(skill_name), _EPS)
+                                )
+                                + 0.5 * (
+                                    profile.skill_theta[skill_name] - predictions[skill_name]
+                                ) ** 2 / max(model.skill_variance(skill_name), _EPS)
+                                for skill_name in SKILLS
+                            ) / len(SKILLS)
+                            job_coverage = float(
+                                abs(truth_job - predicted_job) <= 1.96 * job_std
+                            )
+                            job_nll = (
+                                0.5 * math.log(2.0 * math.pi * max(job_variance, _EPS))
+                                + 0.5 * (truth_job - predicted_job) ** 2
+                                / max(job_variance, _EPS)
+                            )
+                        else:
+                            job_std = leaf_coverage = leaf_nll = job_coverage = job_nll = float("nan")
+                            pass_probability = float(predicted_job >= 6.5)
+                        internal_errors = []
+                        if method == "tree":
+                            internal_errors = [
+                                models["tree"].node_mean(node.node_id)
+                                - profile.node_theta[node.node_id]
+                                for node in CAPABILITY_NODES if not node.is_leaf
+                            ]
+                        candidate_rows.append({
+                            "regime": regime,
+                            "seed": seed,
+                            "candidate_id": profile.candidate_id,
+                            "level": profile.level,
+                            "turn": turn,
+                            "method": method,
+                            "leaf_mae": sum(abs(error) for error in leaf_errors) / len(leaf_errors),
+                            "leaf_rmse": math.sqrt(
+                                sum(error * error for error in leaf_errors) / len(leaf_errors)
+                            ),
+                            "internal_node_mae": (
+                                sum(abs(error) for error in internal_errors) / len(internal_errors)
+                                if internal_errors else float("nan")
+                            ),
+                            "true_job_score": truth_job,
+                            "estimated_job_score": predicted_job,
+                            "job_absolute_error": abs(predicted_job - truth_job),
+                            "job_squared_error": (predicted_job - truth_job) ** 2,
+                            "job_posterior_std": job_std,
+                            "job_95_coverage": job_coverage,
+                            "leaf_95_coverage": leaf_coverage,
+                            "job_nll": job_nll,
+                            "leaf_nll": leaf_nll,
+                            "decision_correct": float(
+                                (predicted_job >= 6.5) == (truth_job >= 6.5)
+                            ),
+                            "pass_probability": pass_probability,
+                            "brier_score": (pass_probability - true_pass) ** 2,
+                        })
+
+    metric_names = (
+        "leaf_mae", "leaf_rmse", "internal_node_mae", "job_absolute_error",
+        "job_squared_error", "job_posterior_std", "job_95_coverage",
+        "leaf_95_coverage", "job_nll", "leaf_nll", "decision_correct",
+        "brier_score",
+    )
+    summary_rows: List[Dict[str, object]] = []
+    for regime in regimes:
+        for turn in checkpoints:
+            for method in ESTIMATOR_METHODS:
+                rows = [
+                    row for row in candidate_rows
+                    if row["regime"] == regime and row["turn"] == turn
+                    and row["method"] == method
+                ]
+                summary: Dict[str, object] = {
+                    "regime": regime,
+                    "turn": turn,
+                    "method": method,
+                    "n_seed_candidates": len(rows),
+                }
+                for metric in metric_names:
+                    values = [
+                        float(row[metric]) for row in rows
+                        if not math.isnan(float(row[metric]))
+                    ]
+                    stats = mean_std(values)
+                    summary[f"{metric}_mean"] = stats["mean"]
+                    summary[f"{metric}_std"] = stats["std"]
+                decision_stats = binary_decision_metrics(
+                    [float(row["true_job_score"]) for row in rows],
+                    [float(row["estimated_job_score"]) for row in rows],
+                    [float(row["pass_probability"]) for row in rows],
+                )
+                summary.update(decision_stats)
+                summary_rows.append(summary)
+
+    comparisons: Dict[str, object] = {}
+    final_rows = [row for row in candidate_rows if row["turn"] == questions]
+    row_index = {
+        (row["regime"], row["seed"], row["candidate_id"], row["method"]): row
+        for row in final_rows
+    }
+    for regime in regimes:
+        for baseline in ESTIMATOR_METHODS:
+            if baseline == "tree":
+                continue
+            keys = sorted({
+                (row["seed"], row["candidate_id"])
+                for row in final_rows if row["regime"] == regime and row["method"] == "tree"
+            })
+            differences = [
+                float(row_index[(regime, seed, candidate_id, baseline)]["job_absolute_error"])
+                - float(row_index[(regime, seed, candidate_id, "tree")]["job_absolute_error"])
+                for seed, candidate_id in keys
+            ]
+            comparisons[f"{regime}:tree_vs_{baseline}"] = paired_difference_summary(
+                differences,
+                seed=stable_seed("estimator", regime, baseline, base_seed),
+                positive_interpretation="tree has lower absolute job-score error",
+            )
+
+    result = {
+        "setup": {
+            "seeds": seeds,
+            "candidates_per_seed": n_candidates,
+            "questions": questions,
+            "checkpoints": checkpoints,
+            "regimes": list(regimes),
+            "methods": list(ESTIMATOR_METHODS),
+            "job_profile": job_profile,
+            "shared_observations_across_methods": True,
+        },
+        "summary": summary_rows,
+        "comparisons": comparisons,
+    }
+    write_csv(output_dir / "observations.csv", observation_rows)
+    write_csv(output_dir / "candidate_checkpoint_metrics.csv", candidate_rows)
+    write_csv(output_dir / "summary.csv", summary_rows)
+    atomic_json(output_dir / "summary.json", result)
+    return result
+
+
+def run_structure_ablation(
+    output_root: Path, seeds: int, n_candidates: int, questions: int, base_seed: int,
+) -> Dict:
+    return run_exp2(
+        output_root, seeds, n_candidates, questions,
+        ("tree_bridge", "matched_flat_bridge", "flat_bridge", "independent_bridge"),
+        base_seed, experiment_dir="exp_structure_ablation",
+    )
+
+
+def run_objective_ablation(
+    output_root: Path, seeds: int, n_candidates: int, questions: int, base_seed: int,
+) -> Dict:
+    return run_exp2(
+        output_root, seeds, n_candidates, questions,
+        (
+            "tree_bridge", "tree_bridge_no_job", "tree_bridge_no_global",
+            "tree_bridge_no_hierarchy", "tree_bridge_no_repeat",
+            "tree_uncertainty", "tree_random",
+        ),
+        base_seed, experiment_dir="exp_objective_ablation",
+    )
+
+
+def run_robustness_benchmark(
+    output_root: Path, seeds: int, n_candidates: int, questions: int, base_seed: int,
+) -> Dict:
+    conditions = [
+        ("hierarchical", 0.0),
+        ("weak_hierarchy", 0.0),
+        ("flat_correlated", 0.0),
+        ("independent", 0.0),
+        ("shuffled_tree", 0.10),
+        ("shuffled_tree", 0.20),
+        ("shuffled_tree", 0.40),
+    ]
+    results: Dict[str, object] = {}
+    matrix_rows: List[Dict[str, object]] = []
+    for regime, rate in conditions:
+        label = regime if rate == 0 else f"{regime}_{int(rate * 100)}pct"
+        condition_result = run_exp2(
+            output_root, seeds, n_candidates, questions,
+            ("tree_bridge", "matched_flat_bridge", "independent_bridge", "tree_random"),
+            base_seed,
+            profile_regime=regime,
+            misspecification_rate=rate,
+            experiment_dir=f"exp_robustness/{label}",
+        )
+        results[label] = condition_result
+        for strategy, metrics in condition_result["summary"].items():
+            row: Dict[str, object] = {
+                "condition": label,
+                "profile_regime": regime,
+                "misspecification_rate": rate,
+                "strategy": strategy,
+            }
+            for metric, values in metrics.items():
+                row[f"{metric}_mean"] = values["mean"]
+                row[f"{metric}_std"] = values["std"]
+            matrix_rows.append(row)
+    result = {"conditions": results}
+    write_csv(output_root / "exp_robustness" / "robustness_matrix.csv", matrix_rows)
+    atomic_json(output_root / "exp_robustness" / "summary.json", result)
+    return result
+
+
+def run_job_conditioned_benchmark(
+    output_root: Path, seeds: int, n_candidates: int, questions: int, base_seed: int,
+    job_profiles: Sequence[str],
+) -> Dict:
+    results: Dict[str, object] = {}
+    comparison_rows: List[Dict[str, object]] = []
+    for job_profile in job_profiles:
+        if job_profile == "uniform":
+            continue
+        job_result = run_exp2(
+            output_root, seeds, n_candidates, questions,
+            ("tree_bridge", "tree_bridge_uniform_job", "tree_random"),
+            base_seed,
+            job_profile=job_profile,
+            experiment_dir=f"exp_job_conditioned/{job_profile}",
+        )
+        results[job_profile] = job_result
+        for strategy, metrics in job_result["summary"].items():
+            row: Dict[str, object] = {"job_profile": job_profile, "strategy": strategy}
+            for metric, values in metrics.items():
+                row[f"{metric}_mean"] = values["mean"]
+                row[f"{metric}_std"] = values["std"]
+            comparison_rows.append(row)
+    result = {
+        "job_profiles": list(job_profiles),
+        "domain_weights": JOB_DOMAIN_WEIGHTS,
+        "results": results,
+    }
+    write_csv(
+        output_root / "exp_job_conditioned" / "job_conditioned_comparison.csv",
+        comparison_rows,
+    )
+    atomic_json(output_root / "exp_job_conditioned" / "summary.json", result)
     return result
 
 
@@ -2220,6 +3005,36 @@ def judge_repeat_icc(ratings: Sequence[Sequence[float]]) -> float:
     return (between_ms - within_ms) / denominator if denominator > _EPS else 0.0
 
 
+def judge_repeat_icc_average(ratings: Sequence[Sequence[float]]) -> float:
+    """One-way random-effects reliability of the mean, ICC(1,k)."""
+    matrix = [list(map(float, row)) for row in ratings if len(row) >= 2]
+    if len(matrix) < 2:
+        return float("nan")
+    repeats = min(len(row) for row in matrix)
+    matrix = [row[:repeats] for row in matrix]
+    row_means = [quality_mean(row) for row in matrix]
+    grand = quality_mean([value for row in matrix for value in row])
+    between_ms = repeats * sum((value - grand) ** 2 for value in row_means) / (len(matrix) - 1)
+    within_ms = sum(
+        (value - row_mean) ** 2
+        for row, row_mean in zip(matrix, row_means) for value in row
+    ) / (len(matrix) * (repeats - 1))
+    return (between_ms - within_ms) / between_ms if between_ms > _EPS else 0.0
+
+
+def holm_adjust(pvalues: Mapping[str, float]) -> Dict[str, float]:
+    """Holm family-wise error correction with monotone adjusted p-values."""
+    finite = [(name, float(value)) for name, value in pvalues.items() if not math.isnan(float(value))]
+    ordered = sorted(finite, key=lambda item: item[1])
+    adjusted: Dict[str, float] = {name: float("nan") for name in pvalues}
+    running = 0.0
+    total = len(ordered)
+    for rank, (name, value) in enumerate(ordered):
+        running = max(running, min(1.0, (total - rank) * value))
+        adjusted[name] = running
+    return adjusted
+
+
 def first_attempt_quality(row: Mapping) -> float:
     attempts = row["question_generation_attempts"]
     if not attempts:
@@ -2279,6 +3094,7 @@ def summarize_quality_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
             if per_question else 0.0
         )
         result[f"{metric}_judge_icc_1_1"] = judge_repeat_icc(per_question)
+        result[f"{metric}_judge_icc_1_k"] = judge_repeat_icc_average(per_question)
 
     result.update({
         "first_attempt_pass_rate": quality_mean([
@@ -2400,7 +3216,17 @@ def paired_question_quality_comparison(
             "first_win_rate": quality_mean([float(value > _EPS) for value in deltas]),
             "tie_rate": quality_mean([float(abs(value) <= _EPS) for value in deltas]),
             "first_loss_rate": quality_mean([float(value < -_EPS) for value in deltas]),
+            "paired_sign_flip_p": paired_sign_flip_p(
+                deltas,
+                seed=stable_seed("paired-quality-sign-flip", first, second, metric),
+            ),
         }
+    adjusted = holm_adjust({
+        metric: float(values["paired_sign_flip_p"])
+        for metric, values in metric_results.items()
+    })
+    for metric, value in adjusted.items():
+        metric_results[metric]["holm_adjusted_p"] = value
     overall = metric_results["overall_question_quality"]
     return {
         "available": True,
@@ -2559,7 +3385,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode", choices=[
-            "exp1", "exp2", "qwen", "prompt_ablation", "analyze", "all",
+            "exp1", "exp2", "selector", "estimator", "structure_ablation",
+            "objective_ablation", "robustness", "job_conditioned",
+            "synthetic_suite", "qwen", "prompt_ablation", "analyze", "all",
         ],
         default="all",
     )
@@ -2578,6 +3406,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidates", type=int, default=30, help="Synthetic candidates per seed")
     parser.add_argument("--seeds", type=int, default=20, help="Number of Exp. 2 seeds")
     parser.add_argument("--questions", type=int, default=15, help="Questions per Exp. 2 interview")
+    parser.add_argument(
+        "--profile-regime", choices=PROFILE_REGIMES, default="hierarchical",
+        help="Latent ability data-generating mechanism for selector experiments",
+    )
+    parser.add_argument(
+        "--profile-regimes", nargs="+", choices=PROFILE_REGIMES,
+        default=["hierarchical", "weak_hierarchy", "flat_correlated", "independent"],
+        help="Data-generating mechanisms for the estimator benchmark",
+    )
+    parser.add_argument(
+        "--misspecification-rate", type=float, default=0.0,
+        help="Fraction of leaf placements corrupted in shuffled_tree profiles",
+    )
+    parser.add_argument(
+        "--job-profile", choices=list(JOB_WEIGHT_PROFILES), default="uniform",
+    )
+    parser.add_argument(
+        "--job-profiles", nargs="+", choices=list(JOB_WEIGHT_PROFILES),
+        default=["backend", "cloud_sre", "distributed_systems"],
+    )
     parser.add_argument(
         "--strategies",
         nargs="+",
@@ -2635,7 +3483,13 @@ def main() -> None:
         "scale": "[1,10]",
         "capability_tree": CAPABILITY_TREE,
         "tree_shape": {"root": 1, "domains": 9, "subcapabilities": 27, "leaves": 108},
-        "note": "--mode all runs only synthetic Exp. 1 and Exp. 2; Qwen is explicit.",
+        "job_domain_weights": JOB_DOMAIN_WEIGHTS,
+        "profile_regimes": list(PROFILE_REGIMES),
+        "note": (
+            "--mode all preserves the legacy synthetic Exp. 1 and Exp. 2. "
+            "--mode synthetic_suite runs the publication synthetic suite. "
+            "Qwen modes always require explicit selection."
+        ),
     }
     atomic_json(output_root / "manifest.json", manifest)
 
@@ -2643,7 +3497,7 @@ def main() -> None:
         result = run_exp1(output_root, args.candidates, args.seed)
         print_compact("Exp. 1 complete", result)
 
-    if args.mode in ("exp2", "all"):
+    if args.mode in ("exp2", "selector", "all"):
         result = run_exp2(
             output_root=output_root,
             seeds=args.seeds,
@@ -2651,8 +3505,43 @@ def main() -> None:
             questions=args.questions,
             strategies=args.strategies,
             base_seed=args.seed,
+            job_profile=args.job_profile,
+            profile_regime=args.profile_regime,
+            misspecification_rate=args.misspecification_rate,
         )
         print_compact("Exp. 2 complete", result)
+
+    if args.mode in ("estimator", "synthetic_suite"):
+        result = run_estimator_benchmark(
+            output_root, args.seeds, args.candidates, args.questions, args.seed,
+            args.profile_regimes, args.job_profile,
+        )
+        print_compact("Estimator benchmark complete", result)
+
+    if args.mode in ("structure_ablation", "synthetic_suite"):
+        result = run_structure_ablation(
+            output_root, args.seeds, args.candidates, args.questions, args.seed,
+        )
+        print_compact("Structure ablation complete", result)
+
+    if args.mode in ("objective_ablation", "synthetic_suite"):
+        result = run_objective_ablation(
+            output_root, args.seeds, args.candidates, args.questions, args.seed,
+        )
+        print_compact("Objective ablation complete", result)
+
+    if args.mode in ("robustness", "synthetic_suite"):
+        result = run_robustness_benchmark(
+            output_root, args.seeds, args.candidates, args.questions, args.seed,
+        )
+        print_compact("Robustness benchmark complete", result)
+
+    if args.mode in ("job_conditioned", "synthetic_suite"):
+        result = run_job_conditioned_benchmark(
+            output_root, args.seeds, args.candidates, args.questions, args.seed,
+            args.job_profiles,
+        )
+        print_compact("Job-conditioned benchmark complete", result)
 
     if args.mode in ("qwen", "prompt_ablation"):
         api_key = os.environ.get("DASHSCOPE_API_KEY")
