@@ -38,7 +38,8 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
                 type(self).invalid_question_judge_once = False
                 content = "我认为这个问题不够清晰。"
             else:
-                question = payload["messages"][1]["content"]
+                judge_input = payload["messages"][1]["content"]
+                question = judge_input.split("候选问题：", 1)[1].split("\n此前对话：", 1)[0]
                 score = 4 if "简单谈谈" in question else 9
                 content = json.dumps({
                     "skill_relevance": score,
@@ -87,8 +88,8 @@ class QwenPipelineTest(unittest.TestCase):
                     "--qwen-candidates", "3",
                     "--qwen-questions", "3",
                     "--strategies", "bridge", "random",
-                    "--question-judge-repeats", "1",
-                    "--judge-repeats", "1",
+                    "--question-judge-repeats", "3",
+                    "--judge-repeats", "3",
                     "--quality-threshold", "7",
                     "--max-regenerations", "2",
                     "--request-delay", "0",
@@ -103,10 +104,11 @@ class QwenPipelineTest(unittest.TestCase):
                 turns_path = Path(output) / "exp3_qwen" / "turns.jsonl"
                 rows = [json.loads(line) for line in turns_path.read_text().splitlines()]
                 self.assertEqual(len(rows), 18)
-                self.assertTrue(all(row["regeneration_count"] == 1 for row in rows))
-                self.assertTrue(all(row["quality_threshold_met"] for row in rows))
+                self.assertTrue(all(row["regeneration_count"] == 0 for row in rows))
+                self.assertTrue(all(not row["quality_gate_enabled"] for row in rows))
+                self.assertEqual(sum(row["quality_threshold_met"] for row in rows), 9)
                 self.assertTrue(all(len(row["question_quality_scores"]) == 5 for row in rows))
-                self.assertTrue(all(len(row["question_generation_attempts"]) == 2 for row in rows))
+                self.assertTrue(all(len(row["question_generation_attempts"]) == 1 for row in rows))
                 self.assertIn("question_model_raw_output", rows[0]["question_generation_attempts"][0])
                 first_question_judge = rows[0]["question_generation_attempts"][0]["question_judge_details"][0]
                 self.assertEqual(first_question_judge["format_retry_count"], 1)
@@ -133,6 +135,8 @@ class QwenPipelineTest(unittest.TestCase):
                 report = json.loads(analysis_path.read_text(encoding="utf-8"))
                 self.assertEqual(report["n_records"], 18)
                 self.assertTrue(report["bridge_vs_random"]["available"])
+                self.assertEqual(report["overall"]["quality_gate_enabled_rate"], 0.0)
+                self.assertEqual(report["overall"]["below_threshold_rate"], 0.5)
                 self.assertIn("Question quality by strategy", analysis.stdout)
         finally:
             server.shutdown()
