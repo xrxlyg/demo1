@@ -103,7 +103,10 @@ class QwenPipelineTest(unittest.TestCase):
                     capture_output=True, check=True,
                 )
                 turns_path = Path(output) / "exp3_qwen" / "turns.jsonl"
-                rows = [json.loads(line) for line in turns_path.read_text().splitlines()]
+                rows = [
+                    json.loads(line)
+                    for line in turns_path.read_text(encoding="utf-8").splitlines()
+                ]
                 self.assertEqual(len(rows), 18)
                 self.assertTrue(all(row["regeneration_count"] == 0 for row in rows))
                 self.assertTrue(all(not row["quality_gate_enabled"] for row in rows))
