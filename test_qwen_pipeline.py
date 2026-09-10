@@ -43,11 +43,13 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
                 score = 4 if "简单谈谈" in question else 9
                 content = json.dumps({
                     "skill_relevance": score,
+                    "technical_correctness": score,
                     "difficulty_match": score,
                     "clarity": score,
                     "non_redundancy": score,
                     "contextual_coherence": score,
-                    "overall_question_quality": score,
+                    "diagnostic_value": score,
+                    "adaptive_relevance": score,
                     "reason": "需要更具体" if score < 7 else "合格",
                 }, ensure_ascii=False)
         elif "模拟技术面试候选人" in system:
@@ -89,7 +91,6 @@ class QwenPipelineTest(unittest.TestCase):
                     "--qwen-questions", "3",
                     "--strategies", "bridge", "random",
                     "--question-judge-repeats", "3",
-                    "--judge-repeats", "3",
                     "--quality-threshold", "7",
                     "--max-regenerations", "2",
                     "--request-delay", "0",
@@ -107,13 +108,26 @@ class QwenPipelineTest(unittest.TestCase):
                 self.assertTrue(all(row["regeneration_count"] == 0 for row in rows))
                 self.assertTrue(all(not row["quality_gate_enabled"] for row in rows))
                 self.assertEqual(sum(row["quality_threshold_met"] for row in rows), 9)
-                self.assertTrue(all(len(row["question_quality_scores"]) == 5 for row in rows))
+                self.assertTrue(all(len(row["question_quality_scores"]) == 8 for row in rows))
                 self.assertTrue(all(len(row["question_generation_attempts"]) == 1 for row in rows))
                 self.assertIn("question_model_raw_output", rows[0]["question_generation_attempts"][0])
                 first_question_judge = rows[0]["question_generation_attempts"][0]["question_judge_details"][0]
                 self.assertEqual(first_question_judge["format_retry_count"], 1)
-                self.assertEqual(rows[0]["judge_details"][0]["format_retry_count"], 1)
+                self.assertNotIn("judge_details", rows[0])
+                self.assertEqual(rows[0]["ability_observation_source"], "deterministic_latent_simulation")
+                self.assertEqual(rows[0]["question_prompt_variant"], "bridge_adaptive")
+                random_rows = [row for row in rows if row["strategy"] == "random"]
+                self.assertTrue(all(row["question_prompt_variant"] == "baseline" for row in random_rows))
                 calls_after_first = len(FakeDashScopeHandler.calls)
+                self.assertEqual(calls_after_first, 91)
+                systems = [call["messages"][0]["content"] for call in FakeDashScopeHandler.calls]
+                self.assertFalse(any("技术面试评分器" in system for system in systems))
+                question_judge_inputs = [
+                    call["messages"][1]["content"]
+                    for call in FakeDashScopeHandler.calls
+                    if "问题评审器" in call["messages"][0]["content"]
+                ]
+                self.assertTrue(all("bridge_adaptive" not in text for text in question_judge_inputs))
 
                 second = subprocess.run(
                     command, cwd=ROOT, env=environment, text=True,
