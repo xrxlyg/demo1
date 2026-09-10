@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-Single-file experiments for Bayesian risk-aware technical interviews.
+Single-file experiments for hierarchical Bayesian technical interviews.
 
-Kept:
-  1. A fixed six-cluster / 29-skill graph.
-  2. A joint Gaussian Bayesian ability model.
-  3. BRIDGE, uncertainty-only, random, and strong fixed-order selectors.
-  4. Synthetic Exp. 1/2 and an optional three-role Qwen end-to-end pilot.
+The primary model is a four-level capability tree with an explicit Gaussian
+variable at the root, domain, sub-capability, and leaf-skill levels.  Leaf
+observations are conditioned through the joint posterior, so one answer updates
+its ancestors and other skills in proportion to their shared ancestry.
 
-Removed:
-  JD parsing, resume parsing, LLM-generated skill trees, multi-agent routing,
-  competency interviews and training-data code.
+Included:
+  1. A fixed 1-root / 9-domain / 27-sub-capability / 108-leaf tree.
+  2. Exact linear-Gaussian tree, flat-graph, and independent-skill posteriors.
+  3. Tree-BRIDGE, Tree-Random, uncertainty, fixed, and propagation ablations.
+  4. Synthetic estimator/selector experiments and an optional Qwen pilot.
+  5. Fixed-target prompt ablation and candidate-paired quality analysis.
 
 Examples:
   python experiment_all_in_one.py --mode exp1 --output runs
   python experiment_all_in_one.py --mode exp2 --seeds 20 --output runs
+  python experiment_all_in_one.py --mode prompt_ablation \
+      --qwen-candidates 3 --qwen-questions 3 --confirm-api-calls --output runs
   python experiment_all_in_one.py --mode all  --seeds 20 --output runs
   python experiment_all_in_one.py --mode analyze --output runs
 
@@ -71,43 +75,184 @@ except ImportError:  # Keep the stdlib-only synthetic experiments runnable.
 
 
 # =============================================================================
-# Fixed experimental assets
+# Fixed four-level capability tree
 # =============================================================================
 
-SKILL_CLUSTERS: Dict[str, List[str]] = {
-    "programming": [
-        "Java", "Python", "Concurrency", "Data Structures", "Design Patterns",
-    ],
-    "database_cache": [
-        "SQL Indexing", "Transactions", "MySQL Tuning", "Redis Caching",
-        "Cache Consistency",
-    ],
-    "distributed_systems": [
-        "CAP Trade-offs", "Consensus", "Distributed Transactions",
-        "Service Discovery", "Fault Tolerance",
-    ],
-    "middleware": [
-        "Kafka", "Message Reliability", "Idempotency", "Async Architecture",
-    ],
-    "cloud_devops": [
-        "Docker", "Kubernetes", "CI/CD", "Observability", "Cloud Architecture",
-    ],
-    "system_design": [
-        "Scalability", "Load Balancing", "API Design", "Security",
-        "Performance Optimization",
-    ],
+CAPABILITY_TREE: Dict[str, Dict[str, List[str]]] = {
+    "Programming": {
+        "Language Foundations": ["Java", "Python", "Go", "Type Systems"],
+        "Algorithms": [
+            "Data Structures", "Algorithm Design", "Complexity Analysis",
+            "Dynamic Programming",
+        ],
+        "Concurrent Programming": [
+            "Threads", "Locks", "Async Programming", "Memory Model",
+        ],
+    },
+    "Database and Storage": {
+        "Relational Databases": [
+            "SQL", "Query Planning", "SQL Indexing", "Transactions",
+        ],
+        "Storage Engines": [
+            "MySQL Tuning", "MVCC", "Database Replication", "Database Sharding",
+        ],
+        "Caching": [
+            "Redis Caching", "Cache Consistency", "Cache Eviction",
+            "Distributed Cache",
+        ],
+    },
+    "Distributed Systems": {
+        "Distributed Fundamentals": [
+            "CAP Trade-offs", "Consistency Models", "Data Partitioning",
+            "Distributed Fault Models",
+        ],
+        "Consistency and Coordination": [
+            "Consensus", "Leader Election", "Distributed Locks",
+            "Cluster Membership",
+        ],
+        "Distributed Transactions": [
+            "Two-Phase Commit", "Saga Pattern", "Idempotency",
+            "Eventual Consistency",
+        ],
+    },
+    "Middleware and Messaging": {
+        "Messaging Platforms": ["Kafka", "RabbitMQ", "Publish-Subscribe", "Message Ordering"],
+        "Delivery Semantics": [
+            "At-Least-Once Delivery", "Exactly-Once Semantics", "Dead-Letter Queues",
+            "Backpressure",
+        ],
+        "Service Integration": [
+            "API Gateway", "Service Discovery", "RPC", "Event-Driven Architecture",
+        ],
+    },
+    "Cloud and DevOps": {
+        "Containers and Orchestration": [
+            "Docker", "Kubernetes", "Container Scheduling", "Service Mesh",
+        ],
+        "Delivery Automation": [
+            "CI/CD", "Infrastructure as Code", "Release Strategies",
+            "Artifact Management",
+        ],
+        "Cloud Operations": [
+            "Observability", "Site Reliability Engineering", "Incident Response",
+            "Capacity Planning",
+        ],
+    },
+    "System Design": {
+        "Architecture": [
+            "Service Decomposition", "Scalability", "Load Balancing", "Multi-Tenancy",
+        ],
+        "Interface Design": ["API Design", "REST", "GraphQL", "API Versioning"],
+        "Performance Engineering": [
+            "Performance Optimization", "Queueing", "Content Delivery Networks",
+            "Rate Limiting",
+        ],
+    },
+    "Security": {
+        "Application Security": [
+            "Authentication", "Authorization", "OWASP Risks", "Input Validation",
+        ],
+        "Data Security": [
+            "Encryption", "Key Management", "Secrets Management", "Data Privacy",
+        ],
+        "Cloud Security": [
+            "Identity and Access Management", "Network Security",
+            "Software Supply Chain Security", "Threat Modeling",
+        ],
+    },
+    "Software Engineering Practice": {
+        "Design Quality": ["Design Patterns", "SOLID Principles", "Refactoring", "Code Review"],
+        "Team Practice": ["Git", "Agile Delivery", "Requirements Analysis", "Documentation"],
+        "Sustainable Delivery": [
+            "Engineering Estimation", "Technical Debt", "Feature Flags",
+            "Backward Compatibility",
+        ],
+    },
+    "Testing and Reliability": {
+        "Testing Methods": [
+            "Unit Testing", "Integration Testing", "End-to-End Testing",
+            "Property-Based Testing",
+        ],
+        "Resilience Engineering": [
+            "Fault Tolerance", "Circuit Breakers", "Retry Strategies",
+            "Chaos Engineering",
+        ],
+        "Quality Engineering": [
+            "Static Analysis", "Debugging", "Profiling", "Testability",
+        ],
+    },
 }
 
-SKILLS = [skill for cluster in SKILL_CLUSTERS.values() for skill in cluster]
+ROOT_NODE = "root"
+ROOT_LABEL = "Software Engineering Ability"
+
+
+@dataclass(frozen=True)
+class CapabilityNode:
+    node_id: str
+    label: str
+    parent_id: Optional[str]
+    level: int
+    is_leaf: bool
+    path: Tuple[str, ...]
+
+
+def _node_token(text: str) -> str:
+    return "_".join("".join(character.lower() if character.isalnum() else " " for character in text).split())
+
+
+def build_capability_nodes() -> Tuple[List[CapabilityNode], Dict[str, str]]:
+    nodes = [CapabilityNode(ROOT_NODE, ROOT_LABEL, None, 0, False, (ROOT_LABEL,))]
+    leaf_to_node: Dict[str, str] = {}
+    for domain, branches in CAPABILITY_TREE.items():
+        domain_id = f"domain::{_node_token(domain)}"
+        nodes.append(CapabilityNode(
+            domain_id, domain, ROOT_NODE, 1, False, (ROOT_LABEL, domain),
+        ))
+        for branch, skills in branches.items():
+            branch_id = f"branch::{_node_token(domain)}::{_node_token(branch)}"
+            nodes.append(CapabilityNode(
+                branch_id, branch, domain_id, 2, False,
+                (ROOT_LABEL, domain, branch),
+            ))
+            for skill in skills:
+                if skill in leaf_to_node:
+                    raise ValueError(f"Duplicate leaf skill in CAPABILITY_TREE: {skill}")
+                leaf_id = f"leaf::{_node_token(domain)}::{_node_token(branch)}::{_node_token(skill)}"
+                leaf_to_node[skill] = leaf_id
+                nodes.append(CapabilityNode(
+                    leaf_id, skill, branch_id, 3, True,
+                    (ROOT_LABEL, domain, branch, skill),
+                ))
+    return nodes, leaf_to_node
+
+
+CAPABILITY_NODES, SKILL_TO_NODE = build_capability_nodes()
+NODE_BY_ID = {node.node_id: node for node in CAPABILITY_NODES}
+SKILLS = [node.label for node in CAPABILITY_NODES if node.is_leaf]
+CLUSTERS = list(CAPABILITY_TREE)
+SKILL_CLUSTERS: Dict[str, List[str]] = {
+    domain: [skill for skills in branches.values() for skill in skills]
+    for domain, branches in CAPABILITY_TREE.items()
+}
 SKILL_TO_CLUSTER = {
-    skill: cluster
-    for cluster, skills in SKILL_CLUSTERS.items()
+    skill: domain for domain, skills in SKILL_CLUSTERS.items() for skill in skills
+}
+SKILL_TO_BRANCH = {
+    skill: branch
+    for _domain, branches in CAPABILITY_TREE.items()
+    for branch, skills in branches.items()
     for skill in skills
 }
-CLUSTERS = list(SKILL_CLUSTERS)
-assert len(SKILLS) == 29
+SKILL_PATHS = {
+    node.label: node.path for node in CAPABILITY_NODES if node.is_leaf
+}
+assert len(CAPABILITY_NODES) == 145
+assert len(CLUSTERS) == 9
+assert sum(len(branches) for branches in CAPABILITY_TREE.values()) == 27
+assert len(SKILLS) == 108
 
-# Equal cluster contribution; leaves within a cluster share its weight.
+# Equal domain contribution; leaves within a domain share its weight.
 JOB_WEIGHTS = {
     skill: 1.0 / len(CLUSTERS) / len(SKILL_CLUSTERS[cluster])
     for cluster, skills in SKILL_CLUSTERS.items()
@@ -133,8 +278,8 @@ LEVEL_ZH = {
 
 FIXED_ORDER: List[str] = []
 for position in range(max(len(v) for v in SKILL_CLUSTERS.values())):
-    for cluster in CLUSTERS:
-        skills = SKILL_CLUSTERS[cluster]
+    for domain in CLUSTERS:
+        skills = SKILL_CLUSTERS[domain]
         if position < len(skills):
             FIXED_ORDER.append(skills[position])
 assert sorted(FIXED_ORDER) == sorted(SKILLS)
@@ -283,6 +428,7 @@ class CandidateProfile:
     performance_std: float
     strong_clusters: List[str]
     skill_theta: Dict[str, float]
+    node_theta: Dict[str, float]
 
 
 def balanced_levels(n_candidates: int) -> List[str]:
@@ -304,18 +450,28 @@ def generate_profiles(n_candidates: int, seed: int) -> List[CandidateProfile]:
         config = LEVEL_CONFIG[level]
         global_theta = clip(rng.gauss(config["mean"], config["std"]))
         strong = sorted(rng.sample(CLUSTERS, config["strong"]))
-        cluster_effect = {}
-        for cluster in CLUSTERS:
-            base = 0.75 if cluster in strong else -0.35
-            cluster_effect[cluster] = base + rng.gauss(0.0, 0.25)
-        skill_theta = {
-            skill: clip(
-                global_theta
-                + cluster_effect[SKILL_TO_CLUSTER[skill]]
-                + rng.gauss(0.0, 0.45)
+        node_theta = {ROOT_NODE: global_theta}
+        skill_theta = {}
+        for domain, branches in CAPABILITY_TREE.items():
+            domain_id = next(
+                node.node_id for node in CAPABILITY_NODES
+                if node.level == 1 and node.label == domain
             )
-            for skill in SKILLS
-        }
+            domain_shift = 0.75 if domain in strong else -0.35
+            domain_theta = clip(global_theta + domain_shift + rng.gauss(0.0, 0.30))
+            node_theta[domain_id] = domain_theta
+            for branch, skills in branches.items():
+                branch_id = next(
+                    node.node_id for node in CAPABILITY_NODES
+                    if node.level == 2 and node.label == branch
+                    and node.parent_id == domain_id
+                )
+                branch_theta = clip(domain_theta + rng.gauss(0.0, 0.40))
+                node_theta[branch_id] = branch_theta
+                for skill in skills:
+                    value = clip(branch_theta + rng.gauss(0.0, 0.50))
+                    skill_theta[skill] = value
+                    node_theta[SKILL_TO_NODE[skill]] = value
         profiles.append(CandidateProfile(
             candidate_id=candidate_id,
             level=level,
@@ -323,6 +479,7 @@ def generate_profiles(n_candidates: int, seed: int) -> List[CandidateProfile]:
             performance_std=config["performance_std"],
             strong_clusters=strong,
             skill_theta=skill_theta,
+            node_theta=node_theta,
         ))
     return profiles
 
@@ -353,45 +510,152 @@ def simulate_score(
 # =============================================================================
 
 class BayesianAbilityModel:
-    """Exact linear-Gaussian posterior over all 29 skill abilities."""
+    """Exact joint Gaussian posterior under tree, flat, or independent priors.
+
+    In ``tree`` mode every one of the 145 nodes is a random variable.  The
+    prior is induced by ``theta_child = theta_parent + eta_level``.  Therefore
+    covariance between any two nodes is exactly the accumulated innovation
+    variance on their shared ancestral path.  Conditioning on a leaf score is
+    standard Gaussian conditioning over the full node covariance matrix.
+    """
+
+    MODES = ("tree", "flat", "independent")
 
     def __init__(
         self,
-        graph_enabled: bool = True,
+        graph_enabled: Optional[bool] = None,
+        propagation: str = "tree",
         prior_mean: float = 5.0,
         prior_std: float = 2.5,
         observation_std: float = 1.2,
         graph_correlation: float = 0.65,
         graph_length_scale: float = 1.5,
+        root_std: float = 1.5,
+        inheritance_stds: Sequence[float] = (1.2, 1.0, 1.1),
     ) -> None:
+        if graph_enabled is not None:
+            propagation = "tree" if graph_enabled else "independent"
+        if propagation not in self.MODES:
+            raise ValueError(f"propagation must be one of {self.MODES}, got {propagation!r}")
+        if len(inheritance_stds) != 3:
+            raise ValueError("inheritance_stds must contain L1, L2, and leaf standard deviations")
+        self.propagation = propagation
         self.skills = list(SKILLS)
-        self.index = {skill: index for index, skill in enumerate(self.skills)}
-        self.mean = [float(prior_mean)] * len(self.skills)
+        self.nodes = (
+            [node.node_id for node in CAPABILITY_NODES]
+            if propagation == "tree"
+            else [SKILL_TO_NODE[skill] for skill in SKILLS]
+        )
+        self.index = {node_id: index for index, node_id in enumerate(self.nodes)}
+        self.mean = [float(prior_mean)] * len(self.nodes)
         self.observations = {skill: 0 for skill in self.skills}
         self.default_observation_variance = observation_std ** 2
-        prior_variance = prior_std ** 2
-        self.covariance = [[0.0] * len(self.skills) for _ in self.skills]
-        for i, first in enumerate(self.skills):
-            for j, second in enumerate(self.skills):
-                if i == j:
-                    self.covariance[i][j] = prior_variance
-                elif graph_enabled:
-                    distance = 2 if SKILL_TO_CLUSTER[first] == SKILL_TO_CLUSTER[second] else 4
-                    self.covariance[i][j] = (
-                        prior_variance
-                        * graph_correlation
-                        * math.exp(-distance / graph_length_scale)
+        self.root_std = float(root_std)
+        self.inheritance_stds = tuple(float(value) for value in inheritance_stds)
+        self.covariance = [[0.0] * len(self.nodes) for _ in self.nodes]
+        if propagation == "tree":
+            innovation_variance = {
+                0: self.root_std ** 2,
+                1: self.inheritance_stds[0] ** 2,
+                2: self.inheritance_stds[1] ** 2,
+                3: self.inheritance_stds[2] ** 2,
+            }
+            ancestor_sets = {
+                node_id: set(self._ancestor_ids(node_id, include_self=True))
+                for node_id in self.nodes
+            }
+            for i, first in enumerate(self.nodes):
+                for j in range(i, len(self.nodes)):
+                    second = self.nodes[j]
+                    shared = ancestor_sets[first] & ancestor_sets[second]
+                    value = sum(
+                        innovation_variance[NODE_BY_ID[node_id].level]
+                        for node_id in shared
                     )
+                    self.covariance[i][j] = value
+                    self.covariance[j][i] = value
+        else:
+            prior_variance = prior_std ** 2
+            for i, first_id in enumerate(self.nodes):
+                first = NODE_BY_ID[first_id].label
+                for j, second_id in enumerate(self.nodes):
+                    second = NODE_BY_ID[second_id].label
+                    if i == j:
+                        value = prior_variance
+                    elif propagation == "flat":
+                        if SKILL_TO_BRANCH[first] == SKILL_TO_BRANCH[second]:
+                            distance = 2
+                        elif SKILL_TO_CLUSTER[first] == SKILL_TO_CLUSTER[second]:
+                            distance = 4
+                        else:
+                            distance = 6
+                        value = (
+                            prior_variance * graph_correlation
+                            * math.exp(-distance / graph_length_scale)
+                        )
+                    else:
+                        value = 0.0
+                    self.covariance[i][j] = value
+
+    @staticmethod
+    def _ancestor_ids(node_id: str, include_self: bool = False) -> List[str]:
+        result = [node_id] if include_self else []
+        current = NODE_BY_ID[node_id]
+        while current.parent_id is not None:
+            result.append(current.parent_id)
+            current = NODE_BY_ID[current.parent_id]
+        result.reverse()
+        return result
+
+    def _skill_index(self, skill: str) -> int:
+        if skill not in SKILL_TO_NODE:
+            raise KeyError(f"Unknown leaf skill: {skill}")
+        return self.index[SKILL_TO_NODE[skill]]
 
     def skill_mean(self, skill: str) -> float:
-        return self.mean[self.index[skill]]
+        return self.mean[self._skill_index(skill)]
 
     def skill_variance(self, skill: str) -> float:
-        index = self.index[skill]
+        index = self._skill_index(skill)
         return max(self.covariance[index][index], _EPS)
 
+    def node_mean(self, node_id: str) -> float:
+        if node_id not in self.index:
+            raise KeyError(f"Node {node_id!r} is not explicit in {self.propagation} mode")
+        return self.mean[self.index[node_id]]
+
+    def node_variance(self, node_id: str) -> float:
+        if node_id not in self.index:
+            raise KeyError(f"Node {node_id!r} is not explicit in {self.propagation} mode")
+        index = self.index[node_id]
+        return max(self.covariance[index][index], _EPS)
+
+    def posterior_path(self, skill: str) -> List[Dict[str, object]]:
+        node_ids = self._ancestor_ids(SKILL_TO_NODE[skill], include_self=True)
+        result = []
+        for node_id in node_ids:
+            node = NODE_BY_ID[node_id]
+            if node_id in self.index:
+                mean = self.node_mean(node_id)
+                variance = self.node_variance(node_id)
+            else:
+                descendants = [
+                    name for name in SKILLS
+                    if tuple(SKILL_PATHS[name][:node.level + 1]) == node.path
+                ]
+                mean = sum(self.skill_mean(name) for name in descendants) / len(descendants)
+                variance = sum(self.skill_variance(name) for name in descendants) / len(descendants)
+            result.append({
+                "node_id": node_id,
+                "label": node.label,
+                "level": node.level,
+                "posterior_mean": mean,
+                "posterior_std": math.sqrt(variance),
+            })
+        return result
+
     def update(self, skill: str, score: float, observation_std: Optional[float] = None) -> None:
-        j = self.index[skill]
+        j = self._skill_index(skill)
         noise = (
             self.default_observation_variance
             if observation_std is None
@@ -401,9 +665,9 @@ class BayesianAbilityModel:
         old_covariance = [list(row) for row in self.covariance]
         denominator = max(old_covariance[j][j] + noise, _EPS)
         innovation = clip(score) - old_mean[j]
-        gain = [old_covariance[i][j] / denominator for i in range(len(self.skills))]
-        self.mean = [old_mean[i] + gain[i] * innovation for i in range(len(self.skills))]
-        n = len(self.skills)
+        gain = [old_covariance[i][j] / denominator for i in range(len(self.nodes))]
+        self.mean = [old_mean[i] + gain[i] * innovation for i in range(len(self.nodes))]
+        n = len(self.nodes)
         updated = [[0.0] * n for _ in range(n)]
         for i in range(n):
             for k in range(n):
@@ -426,14 +690,20 @@ class BayesianAbilityModel:
     def job_variance(self) -> float:
         total = 0.0
         for first, wf in JOB_WEIGHTS.items():
-            i = self.index[first]
+            i = self._skill_index(first)
             for second, ws in JOB_WEIGHTS.items():
-                j = self.index[second]
+                j = self._skill_index(second)
                 total += wf * ws * self.covariance[i][j]
         return max(total, 0.0)
 
     def total_variance(self) -> float:
-        return sum(self.covariance[i][i] for i in range(len(self.skills)))
+        return sum(self.covariance[i][i] for i in range(len(self.nodes)))
+
+    def hierarchy_variance(self, skill: str) -> float:
+        if self.propagation != "tree":
+            return 0.0
+        path = self._ancestor_ids(SKILL_TO_NODE[skill], include_self=False)
+        return sum(self.node_variance(node_id) for node_id in path)
 
     def risk_components(
         self,
@@ -445,38 +715,74 @@ class BayesianAbilityModel:
     ) -> Dict[str, float]:
         efficiency = difficulty_efficiency(self.skill_mean(skill), difficulty)
         observation_variance = self.default_observation_variance / efficiency
-        j = self.index[skill]
+        j = self._skill_index(skill)
         denominator = self.covariance[j][j] + observation_variance
         covariance_with_job = sum(
-            JOB_WEIGHTS[name] * self.covariance[self.index[name]][j]
+            JOB_WEIGHTS[name] * self.covariance[self._skill_index(name)][j]
             for name in SKILLS
         )
         decision_reduction = covariance_with_job ** 2 / max(denominator, _EPS)
         global_reduction = sum(row[j] ** 2 for row in self.covariance) / max(denominator, _EPS)
+        hierarchy_node_ids = (
+            self._ancestor_ids(SKILL_TO_NODE[skill], include_self=False)
+            if self.propagation == "tree" else []
+        )
+        hierarchy_reduction = sum(
+            self.covariance[self.index[node_id]][j] ** 2
+            for node_id in hierarchy_node_ids
+        ) / max(denominator, _EPS)
         if job_variance is None:
             job_variance = self.job_variance()
         if total_variance is None:
             total_variance = self.total_variance()
         relative_decision = decision_reduction / max(job_variance, _EPS)
         relative_global = global_reduction / max(total_variance, _EPS)
+        hierarchy_variance = self.hierarchy_variance(skill)
+        relative_hierarchy = hierarchy_reduction / max(hierarchy_variance, _EPS)
         repeat_count = sum(1 for name in recent if name == skill)
         question_cost = 1.0 + 0.15 * repeat_count
-        utility = (0.70 * relative_decision + 0.30 * relative_global) / question_cost
+        utility = (
+            0.55 * relative_decision
+            + 0.25 * relative_global
+            + 0.20 * relative_hierarchy
+        ) / question_cost
         return {
             "utility": utility,
             "decision_reduction": decision_reduction,
             "global_reduction": global_reduction,
+            "hierarchy_reduction": hierarchy_reduction,
             "relative_decision_reduction": relative_decision,
             "relative_global_reduction": relative_global,
+            "relative_hierarchy_reduction": relative_hierarchy,
             "difficulty_efficiency": efficiency,
             "observation_std": math.sqrt(observation_variance),
             "question_cost": question_cost,
+            "propagation": self.propagation,
         }
 
 
 # =============================================================================
 # Selection strategies
 # =============================================================================
+
+STRATEGY_SPECS = {
+    "bridge": ("tree", "bridge"),
+    "tree_bridge": ("tree", "bridge"),
+    "random": ("tree", "random"),
+    "tree_random": ("tree", "random"),
+    "flat_bridge": ("flat", "bridge"),
+    "independent_bridge": ("independent", "bridge"),
+    "uncertainty": ("tree", "uncertainty"),
+    "fixed": ("tree", "fixed"),
+}
+
+
+def strategy_spec(strategy: str) -> Tuple[str, str]:
+    try:
+        return STRATEGY_SPECS[strategy]
+    except KeyError as exc:
+        raise ValueError(f"Unknown strategy: {strategy}") from exc
+
 
 def select_skill(
     strategy: str,
@@ -486,13 +792,14 @@ def select_skill(
     seed: int,
     candidate_id: int,
 ) -> Tuple[str, str, Dict[str, float]]:
-    if strategy == "random":
+    _propagation, policy = strategy_spec(strategy)
+    if policy == "random":
         rng = random.Random(stable_seed("policy", seed, strategy, candidate_id, turn))
         skill = rng.choice(SKILLS)
         difficulty = closest_difficulty(model.skill_mean(skill))
         return skill, difficulty, model.risk_components(skill, difficulty, recent)
 
-    if strategy == "fixed":
+    if policy == "fixed":
         skill = FIXED_ORDER[turn % len(FIXED_ORDER)]
         difficulty = closest_difficulty(model.skill_mean(skill))
         return skill, difficulty, model.risk_components(skill, difficulty, recent)
@@ -511,15 +818,13 @@ def select_skill(
             job_variance=current_job_variance,
             total_variance=current_total_variance,
         )
-        if strategy == "uncertainty":
+        if policy == "uncertainty":
             noise_variance = components["observation_std"] ** 2
             variance = model.skill_variance(skill)
             score = (variance ** 2 / (variance + noise_variance)) / max(variance, _EPS)
             score /= components["question_cost"]
-        elif strategy == "bridge":
+        elif policy == "bridge":
             score = components["utility"]
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
         scored.append((score, skill, difficulty, components))
     scored.sort(key=lambda item: (-item[0], item[1]))
     _, skill, difficulty, components = scored[0]
@@ -649,7 +954,8 @@ def strategy_for_candidate(
     questions: int,
     seed: int,
 ) -> Dict:
-    model = BayesianAbilityModel(graph_enabled=True)
+    propagation, _policy = strategy_spec(strategy)
+    model = BayesianAbilityModel(propagation=propagation)
     recent: List[str] = []
     per_skill_count = defaultdict(int)
     trace = []
@@ -671,6 +977,8 @@ def strategy_for_candidate(
             "turn": turn + 1,
             "skill": skill,
             "cluster": SKILL_TO_CLUSTER[skill],
+            "branch": SKILL_TO_BRANCH[skill],
+            "capability_path": list(SKILL_PATHS[skill]),
             "difficulty": difficulty,
             "score": score,
             "posterior_job_mean": model.job_mean(),
@@ -686,6 +994,7 @@ def strategy_for_candidate(
         "candidate_id": profile.candidate_id,
         "level": profile.level,
         "strategy": strategy,
+        "propagation": propagation,
         "true_job_score": truth,
         "estimated_job_score": prediction,
         "absolute_error": abs(prediction - truth),
@@ -760,13 +1069,14 @@ def run_exp2(
         }
 
     comparisons = {}
-    if "bridge" in strategies:
+    bridge_name = "tree_bridge" if "tree_bridge" in strategies else "bridge"
+    if bridge_name in strategies:
         bridge_by_seed = {
             row["seed"]: row["mae"]
-            for row in seed_metrics if row["strategy"] == "bridge"
+            for row in seed_metrics if row["strategy"] == bridge_name
         }
         for baseline in strategies:
-            if baseline == "bridge":
+            if baseline == bridge_name:
                 continue
             baseline_by_seed = {
                 row["seed"]: row["mae"]
@@ -774,7 +1084,7 @@ def run_exp2(
             }
             common = sorted(set(bridge_by_seed) & set(baseline_by_seed))
             differences = [baseline_by_seed[s] - bridge_by_seed[s] for s in common]
-            comparisons[f"bridge_vs_{baseline}"] = {
+            comparisons[f"{bridge_name}_vs_{baseline}"] = {
                 "positive_means_bridge_lower_mae": True,
                 "mean_mae_improvement": sum(differences) / len(differences),
                 "paired_sign_flip_p": paired_sign_flip_p(
@@ -883,6 +1193,30 @@ QUESTION_QUALITY_DIMENSIONS = (
     "diagnostic_value",
     "adaptive_relevance",
 )
+GENERAL_QUALITY_DIMENSIONS = (
+    "skill_relevance", "technical_correctness", "difficulty_match", "clarity",
+    "non_redundancy",
+)
+ADAPTIVE_QUALITY_DIMENSIONS = (
+    "contextual_coherence", "diagnostic_value", "adaptive_relevance",
+)
+COMPOSITE_QUALITY_METRICS = (
+    "general_question_quality", "adaptive_diagnostic_quality",
+    "overall_question_quality",
+)
+
+
+def add_quality_composites(scores: Dict[str, float]) -> Dict[str, float]:
+    scores["general_question_quality"] = quality_mean([
+        scores[name] for name in GENERAL_QUALITY_DIMENSIONS
+    ])
+    scores["adaptive_diagnostic_quality"] = quality_mean([
+        scores[name] for name in ADAPTIVE_QUALITY_DIMENSIONS
+    ])
+    scores["overall_question_quality"] = quality_mean([
+        scores[name] for name in QUESTION_QUALITY_DIMENSIONS
+    ])
+    return scores
 
 
 def build_question_context(
@@ -899,19 +1233,72 @@ def build_question_context(
         boundary = "区分仅会解释概念与能够进行实际工程权衡"
     else:
         boundary = "区分熟练应用与能够处理边界条件、故障和复杂权衡"
+    path_posteriors = ability_model.posterior_path(skill)
+    siblings = [
+        name for name in CAPABILITY_TREE[SKILL_TO_CLUSTER[skill]][SKILL_TO_BRANCH[skill]]
+        if name != skill
+    ]
+    sibling_posteriors = [
+        {
+            "skill": name,
+            "posterior_mean": ability_model.skill_mean(name),
+            "posterior_std": math.sqrt(ability_model.skill_variance(name)),
+        }
+        for name in siblings
+    ]
+    evidence = sorted(
+        (
+            {
+                "skill": name,
+                "observations": count,
+                "posterior_mean": ability_model.skill_mean(name),
+                "posterior_std": math.sqrt(ability_model.skill_variance(name)),
+            }
+            for name, count in ability_model.observations.items() if count > 0
+        ),
+        key=lambda row: (-int(row["observations"]), str(row["skill"])),
+    )[:12]
+    weaknesses = sorted(
+        (
+            {
+                "skill": name,
+                "posterior_mean": ability_model.skill_mean(name),
+                "posterior_std": math.sqrt(ability_model.skill_variance(name)),
+            }
+            for name in SKILLS
+        ),
+        key=lambda row: (float(row["posterior_mean"]), -float(row["posterior_std"])),
+    )[:5]
+    _propagation, policy = strategy_spec(strategy)
     return {
         "skill": skill,
         "cluster": SKILL_TO_CLUSTER[skill],
-        "related_skills": [
-            name for name in SKILL_CLUSTERS[SKILL_TO_CLUSTER[skill]] if name != skill
-        ],
+        "branch": SKILL_TO_BRANCH[skill],
+        "capability_path": list(SKILL_PATHS[skill]),
+        "path_posteriors": path_posteriors,
+        "related_skills": siblings,
+        "sibling_posteriors": sibling_posteriors,
+        "observed_evidence": evidence,
+        "weaknesses": weaknesses,
         "posterior_mean": posterior_mean,
         "posterior_std": posterior_std,
         "decision_variance_reduction": selector["decision_reduction"],
         "global_variance_reduction": selector["global_reduction"],
+        "hierarchy_variance_reduction": selector["hierarchy_reduction"],
+        "relative_decision_variance_reduction": selector["relative_decision_reduction"],
+        "relative_branch_variance_reduction": selector["relative_hierarchy_reduction"],
         "selection_utility": selector["utility"],
         "diagnostic_goal": boundary,
-        "prompt_variant": "bridge_adaptive" if strategy == "bridge" else "baseline",
+        "diagnostic_hypothesis": (
+            f"A targeted question on {skill} should {boundary}; evidence from "
+            f"nearby abilities remains {'sparse' if not evidence else 'partially observed'}."
+        ),
+        "propagation": ability_model.propagation,
+        "prompt_variant": (
+            "bridge_adaptive"
+            if policy == "bridge" and ability_model.propagation == "tree"
+            else "baseline"
+        ),
     }
 
 
@@ -945,20 +1332,24 @@ def generate_qwen_question(
         "评分或Markdown。问题必须聚焦指定技能，符合难度，并与对话自然衔接。"
     )
     user_parts = [
+        f"目标能力路径：{' → '.join(question_context['capability_path'])}\n"
         f"目标技能：{skill}\n目标难度：{difficulty}（{difficulty_guidance}）\n"
         f"最近对话：\n{history_text}\n"
         f"全部历史问题：{json.dumps(previous_questions, ensure_ascii=False)}\n"
     ]
     if question_context["prompt_variant"] == "bridge_adaptive":
         user_parts.append(
-            "BRIDGE诊断上下文：\n"
-            f"- 技能簇：{question_context['cluster']}\n"
-            f"- 相关技能：{', '.join(question_context['related_skills'])}\n"
-            f"- 当前能力后验均值：{question_context['posterior_mean']:.3f}/10\n"
-            f"- 当前能力后验标准差：{question_context['posterior_std']:.3f}\n"
-            f"- 选择效用：{question_context['selection_utility']:.6f}\n"
+            "分层BRIDGE诊断上下文：\n"
+            f"- 各层后验：{json.dumps(question_context['path_posteriors'], ensure_ascii=False)}\n"
+            f"- 兄弟技能后验：{json.dumps(question_context['sibling_posteriors'], ensure_ascii=False)}\n"
+            f"- 已观察证据：{json.dumps(question_context['observed_evidence'], ensure_ascii=False)}\n"
+            f"- 当前能力薄弱点：{json.dumps(question_context['weaknesses'], ensure_ascii=False)}\n"
+            f"- 当前诊断假设：{question_context['diagnostic_hypothesis']}\n"
+            f"- 预期岗位方差下降：{question_context['decision_variance_reduction']:.6f}\n"
+            f"- 预期分支方差下降：{question_context['hierarchy_variance_reduction']:.6f}\n"
             f"- 诊断目标：{question_context['diagnostic_goal']}\n"
-            "请围绕当前能力边界设计具有区分度的追问。\n"
+            "请设计一个能在当前最可能的能力状态之间形成可观察答案差异的问题，"
+            "不要只生成普通的技能知识题。\n"
         )
     user_parts.append(
         f"本轮已被拒绝的尝试（必须针对反馈改写且避免重复）：\n{rejected_text}\n"
@@ -1035,7 +1426,7 @@ def evaluate_qwen_question(
 ) -> Tuple[Dict[str, float], List[Dict]]:
     blind_context = {
         key: value for key, value in question_context.items()
-        if key != "prompt_variant"
+        if key not in ("prompt_variant", "propagation")
     }
     prior_dialogue = [
         {
@@ -1075,10 +1466,7 @@ def evaluate_qwen_question(
         name: sum(row[name] for row in details) / len(details)
         for name in QUESTION_QUALITY_DIMENSIONS
     }
-    means["overall_question_quality"] = sum(
-        means[name] for name in QUESTION_QUALITY_DIMENSIONS
-    ) / len(QUESTION_QUALITY_DIMENSIONS)
-    return means, details
+    return add_quality_composites(means), details
 
 
 def generate_qualified_question(
@@ -1162,8 +1550,8 @@ def generate_qwen_answer(
 
 def summarize_question_records(rows: Sequence[Mapping]) -> Dict:
     summary = {"n_questions": len(rows)}
-    for name in (*QUESTION_QUALITY_DIMENSIONS, "overall_question_quality"):
-        values = [float(row[name]) for row in rows] if name == "overall_question_quality" else [
+    for name in (*QUESTION_QUALITY_DIMENSIONS, *COMPOSITE_QUALITY_METRICS):
+        values = [float(row[name]) for row in rows] if name in COMPOSITE_QUALITY_METRICS else [
             float(row["question_quality_scores"][name]) for row in rows
         ]
         summary[f"{name}_mean"] = sum(values) / len(values)
@@ -1210,7 +1598,13 @@ def run_qwen(
     profiles = generate_profiles(n_candidates, seed)
 
     setup = {
-        "schema_version": 4,
+        "schema_version": 5,
+        "capability_tree": {
+            "root_nodes": 1,
+            "domain_nodes": len(CLUSTERS),
+            "subcapability_nodes": sum(len(value) for value in CAPABILITY_TREE.values()),
+            "leaf_nodes": len(SKILLS),
+        },
         "seed": seed,
         "question_model": question_model,
         "question_judge_model": question_judge_model,
@@ -1263,7 +1657,8 @@ def run_qwen(
     with tqdm(total=total, initial=len(existing), desc="Qwen interview turns") as progress:
         for strategy in strategies:
             for profile in profiles:
-                model = BayesianAbilityModel(graph_enabled=True)
+                propagation, _policy = strategy_spec(strategy)
+                model = BayesianAbilityModel(propagation=propagation)
                 recent = []
                 per_skill_count = defaultdict(int)
                 completed = grouped[(strategy, profile.candidate_id)]
@@ -1288,6 +1683,8 @@ def run_qwen(
                         strategy, model, skill, components
                     )
                     job_variance_before = model.job_variance()
+                    total_variance_before = model.total_variance()
+                    hierarchy_variance_before = model.hierarchy_variance(skill)
                     question, quality_scores, regeneration_count, question_attempts = (
                         generate_qualified_question(
                             client=client,
@@ -1319,6 +1716,8 @@ def run_qwen(
                         observation_std=ability_observation_std,
                     )
                     job_variance_after = model.job_variance()
+                    total_variance_after = model.total_variance()
+                    hierarchy_variance_after = model.hierarchy_variance(skill)
                     recent = (recent + [skill])[-6:]
                     per_skill_count[skill] += 1
                     record = {
@@ -1329,6 +1728,8 @@ def run_qwen(
                         "turn": turn,
                         "skill": skill,
                         "cluster": SKILL_TO_CLUSTER[skill],
+                        "branch": SKILL_TO_BRANCH[skill],
+                        "capability_path": list(SKILL_PATHS[skill]),
                         "difficulty": difficulty,
                         "question_prompt_variant": question_context["prompt_variant"],
                         "question_context": question_context,
@@ -1338,6 +1739,8 @@ def run_qwen(
                             for name in QUESTION_QUALITY_DIMENSIONS
                         },
                         "overall_question_quality": quality_scores["overall_question_quality"],
+                        "general_question_quality": quality_scores["general_question_quality"],
+                        "adaptive_diagnostic_quality": quality_scores["adaptive_diagnostic_quality"],
                         "quality_threshold": quality_threshold,
                         "quality_gate_enabled": regenerate_low_quality,
                         "quality_threshold_met": (
@@ -1352,12 +1755,19 @@ def run_qwen(
                         "ability_observation_std": ability_observation_std,
                         "posterior_skill_mean": model.skill_mean(skill),
                         "posterior_skill_std": math.sqrt(model.skill_variance(skill)),
+                        "posterior_path": model.posterior_path(skill),
                         "posterior_job_mean": model.job_mean(),
                         "posterior_job_std": math.sqrt(model.job_variance()),
                         "job_variance_before": job_variance_before,
                         "job_variance_after": job_variance_after,
                         "realized_job_variance_reduction": (
                             job_variance_before - job_variance_after
+                        ),
+                        "realized_global_variance_reduction": (
+                            total_variance_before - total_variance_after
+                        ),
+                        "realized_hierarchy_variance_reduction": (
+                            hierarchy_variance_before - hierarchy_variance_after
                         ),
                         "selector": components,
                     }
@@ -1385,8 +1795,10 @@ def run_qwen(
                 "true_job_score": true_job_score(profile),
                 "estimated_job_score": last["posterior_job_mean"],
                 "posterior_job_std": last["posterior_job_std"],
+                "propagation": strategy_spec(strategy)[0],
                 "skill_coverage": len({row["skill"] for row in rows}) / len(SKILLS),
                 "cluster_coverage": len({row["cluster"] for row in rows}) / len(CLUSTERS),
+                "branch_coverage": len({row["branch"] for row in rows}) / 27,
             })
 
     ability_diagnostics = {}
@@ -1404,6 +1816,7 @@ def run_qwen(
             "decision_accuracy": decision_accuracy(truth, prediction),
             "skill_coverage": sum(row["skill_coverage"] for row in ability_rows) / len(ability_rows),
             "cluster_coverage": sum(row["cluster_coverage"] for row in ability_rows) / len(ability_rows),
+            "branch_coverage": sum(row["branch_coverage"] for row in ability_rows) / len(ability_rows),
         }
         question_quality_summary[strategy] = summarize_question_records(turn_rows)
     result = {
@@ -1424,13 +1837,267 @@ def run_qwen(
             "candidates": n_candidates,
             "questions": questions,
             "strategies": list(strategies),
+            "tree_shape": {"root": 1, "domains": 9, "subcapabilities": 27, "leaves": 108},
         },
         "summary": question_quality_summary,
         "ability_state_diagnostics": ability_diagnostics,
     }
+    all_turn_rows = [row for group in grouped.values() for row in group]
+    if {"bridge", "random"}.issubset(strategies):
+        result["paired_end_to_end_quality"] = paired_question_quality_comparison(
+            all_turn_rows, "bridge", "random"
+        )
+    elif {"tree_bridge", "tree_random"}.issubset(strategies):
+        result["paired_end_to_end_quality"] = paired_question_quality_comparison(
+            all_turn_rows, "tree_bridge", "tree_random"
+        )
     write_csv(output_dir / "candidate_results.csv", candidate_rows)
     atomic_json(output_dir / "summary.json", result)
+    run_question_quality_analysis(turns_path, output_dir / "quality_analysis")
     return result
+
+
+# =============================================================================
+# Fixed-target prompt ablation
+# =============================================================================
+
+def run_prompt_ablation(
+    output_root: Path,
+    api_key: str,
+    base_url: str,
+    question_model: str,
+    question_judge_model: str,
+    candidate_model: str,
+    n_candidates: int,
+    questions: int,
+    question_judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+    regenerate_low_quality: bool,
+    seed: int,
+    request_delay: float,
+) -> Dict:
+    """Compare plain and tree-adaptive prompts under exactly paired targets.
+
+    At a candidate/turn unit, both variants receive the same capability path,
+    difficulty, Gaussian posterior, and immutable history snapshot.  One shared
+    canonical answer is added only after both questions have been judged, so a
+    variant cannot change the other variant's current or future input state.
+    """
+    output_dir = output_root / "exp4_prompt_ablation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    profiles_path = output_dir / "profiles.json"
+    turns_path = output_dir / "turns.jsonl"
+    setup_path = output_dir / "setup.json"
+    profiles = generate_profiles(n_candidates, seed)
+    variants = ("prompt_plain", "prompt_tree")
+    setup = {
+        "schema_version": 1,
+        "seed": seed,
+        "question_model": question_model,
+        "question_judge_model": question_judge_model,
+        "candidate_model": candidate_model,
+        "question_judge_repeats": question_judge_repeats,
+        "quality_threshold": quality_threshold,
+        "max_regenerations": max_regenerations,
+        "regenerate_low_quality": regenerate_low_quality,
+        "ability_update_source": "deterministic_latent_simulation",
+        "candidates": n_candidates,
+        "questions": questions,
+        "prompt_variants": list(variants),
+        "pairing": "same path, skill, difficulty, posterior, history, and candidate state",
+    }
+    if setup_path.exists():
+        saved_setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        if saved_setup != setup:
+            raise ValueError(
+                "Existing exp4_prompt_ablation/setup.json does not match this run; "
+                "use the original arguments or a different --output directory"
+            )
+    else:
+        atomic_json(setup_path, setup)
+    serialized_profiles = [asdict(profile) for profile in profiles]
+    if profiles_path.exists():
+        if json.loads(profiles_path.read_text(encoding="utf-8")) != serialized_profiles:
+            raise ValueError("Existing prompt-ablation profiles do not match the requested setup")
+    else:
+        atomic_json(profiles_path, serialized_profiles)
+
+    existing = load_jsonl(turns_path)
+    grouped: Dict[Tuple[str, int], List[Dict]] = defaultdict(list)
+    seen_keys = set()
+    for row in existing:
+        key = (str(row["strategy"]), int(row["candidate_id"]), int(row["turn"]))
+        if key in seen_keys:
+            raise ValueError(f"Duplicate prompt-ablation record: {key}")
+        if key[0] not in variants:
+            raise ValueError(f"Unexpected prompt-ablation strategy: {key[0]}")
+        seen_keys.add(key)
+        grouped[(key[0], key[1])].append(row)
+    for rows in grouped.values():
+        rows.sort(key=lambda row: int(row["turn"]))
+    for profile in profiles:
+        counts = [len(grouped[(variant, profile.candidate_id)]) for variant in variants]
+        if counts[0] != counts[1]:
+            raise ValueError(
+                f"Incomplete paired prompt-ablation turn for candidate {profile.candidate_id}; "
+                "restore the JSONL to the last complete pair or use another output directory"
+            )
+        for variant in variants:
+            turns = [int(row["turn"]) for row in grouped[(variant, profile.candidate_id)]]
+            if turns != list(range(len(turns))) or len(turns) > questions:
+                raise ValueError(f"Non-contiguous saved turns for {variant}/{profile.candidate_id}")
+
+    client = QwenClient(api_key, base_url)
+    total = n_candidates * len(variants) * questions
+    with tqdm(total=total, initial=len(existing), desc="Fixed-target prompt pairs") as progress:
+        for profile in profiles:
+            model = BayesianAbilityModel(propagation="tree")
+            per_skill_count = defaultdict(int)
+            tree_rows = grouped[("prompt_tree", profile.candidate_id)]
+            shared_history = []
+            for row in tree_rows:
+                model.update(
+                    row["skill"], row["ability_observation_score"],
+                    observation_std=row["ability_observation_std"],
+                )
+                per_skill_count[row["skill"]] += 1
+                shared_history.append({
+                    "turn": row["turn"],
+                    "skill": row["skill"],
+                    "question": row["canonical_question"],
+                    "answer": row["answer"],
+                })
+
+            completed_turns = len(tree_rows)
+            for turn in range(completed_turns, questions):
+                target_index = stable_seed("prompt-target", seed, profile.candidate_id, turn) % len(SKILLS)
+                skill = SKILLS[target_index]
+                difficulty = closest_difficulty(model.skill_mean(skill))
+                components = model.risk_components(skill, difficulty, [
+                    row["skill"] for row in shared_history[-6:]
+                ])
+                base_context = build_question_context("bridge", model, skill, components)
+                history_hash = hashlib.sha256(
+                    json.dumps(shared_history, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                pair_id = f"c{profile.candidate_id:03d}-t{turn:03d}"
+                pending = []
+                for variant in variants:
+                    question_context = dict(base_context)
+                    question_context["prompt_variant"] = (
+                        "bridge_adaptive" if variant == "prompt_tree" else "baseline"
+                    )
+                    question, quality_scores, regeneration_count, question_attempts = (
+                        generate_qualified_question(
+                            client=client,
+                            question_model=question_model,
+                            question_judge_model=question_judge_model,
+                            skill=skill,
+                            difficulty=difficulty,
+                            dialogue_history=shared_history,
+                            judge_repeats=question_judge_repeats,
+                            quality_threshold=quality_threshold,
+                            max_regenerations=max_regenerations,
+                            regenerate_low_quality=regenerate_low_quality,
+                            question_context=question_context,
+                        )
+                    )
+                    pending.append((variant, question_context, question, quality_scores,
+                                    regeneration_count, question_attempts))
+
+                canonical_question = next(
+                    item[2] for item in pending if item[0] == "prompt_tree"
+                )
+                answer = generate_qwen_answer(
+                    client, candidate_model, profile, skill, canonical_question
+                )
+                job_variance_before = model.job_variance()
+                total_variance_before = model.total_variance()
+                hierarchy_variance_before = model.hierarchy_variance(skill)
+                ability_score, ability_observation_std = simulate_score(
+                    profile=profile,
+                    skill=skill,
+                    difficulty=difficulty,
+                    observation_index=per_skill_count[skill],
+                    seed=seed,
+                )
+                model.update(skill, ability_score, observation_std=ability_observation_std)
+                shared_history.append({
+                    "turn": turn,
+                    "skill": skill,
+                    "question": canonical_question,
+                    "answer": answer,
+                })
+                per_skill_count[skill] += 1
+
+                for (variant, question_context, question, quality_scores,
+                     regeneration_count, question_attempts) in pending:
+                    record = {
+                        "created_at": utc_now(),
+                        "strategy": variant,
+                        "candidate_id": profile.candidate_id,
+                        "level": profile.level,
+                        "turn": turn,
+                        "pair_id": pair_id,
+                        "history_snapshot_sha256": history_hash,
+                        "skill": skill,
+                        "cluster": SKILL_TO_CLUSTER[skill],
+                        "branch": SKILL_TO_BRANCH[skill],
+                        "capability_path": list(SKILL_PATHS[skill]),
+                        "difficulty": difficulty,
+                        "question_prompt_variant": question_context["prompt_variant"],
+                        "question_context": question_context,
+                        "question": question,
+                        "question_quality_scores": {
+                            name: quality_scores[name] for name in QUESTION_QUALITY_DIMENSIONS
+                        },
+                        "general_question_quality": quality_scores["general_question_quality"],
+                        "adaptive_diagnostic_quality": quality_scores["adaptive_diagnostic_quality"],
+                        "overall_question_quality": quality_scores["overall_question_quality"],
+                        "quality_threshold": quality_threshold,
+                        "quality_gate_enabled": regenerate_low_quality,
+                        "quality_threshold_met": quality_scores["overall_question_quality"] >= quality_threshold,
+                        "regeneration_count": regeneration_count,
+                        "question_generation_attempts": question_attempts,
+                        "canonical_question": canonical_question,
+                        "answer": answer,
+                        "assigned_skill_theta": profile.skill_theta[skill],
+                        "ability_observation_source": "deterministic_latent_simulation",
+                        "ability_observation_score": ability_score,
+                        "ability_observation_std": ability_observation_std,
+                        "posterior_skill_mean": model.skill_mean(skill),
+                        "posterior_skill_std": math.sqrt(model.skill_variance(skill)),
+                        "posterior_job_mean": model.job_mean(),
+                        "posterior_job_std": math.sqrt(model.job_variance()),
+                        "realized_job_variance_reduction": job_variance_before - model.job_variance(),
+                        "realized_global_variance_reduction": total_variance_before - model.total_variance(),
+                        "realized_hierarchy_variance_reduction": (
+                            hierarchy_variance_before - model.hierarchy_variance(skill)
+                        ),
+                        "selector": components,
+                    }
+                    append_jsonl(turns_path, record)
+                    grouped[(variant, profile.candidate_id)].append(record)
+                    progress.update(1)
+                time.sleep(max(request_delay, 0.0))
+
+    rows = load_jsonl(turns_path)
+    summary = {
+        "setup": setup,
+        "summary": {
+            variant: summarize_question_records([
+                row for row in rows if row["strategy"] == variant
+            ])
+            for variant in variants
+        },
+        "paired_prompt_comparison": paired_question_quality_comparison(
+            rows, "prompt_tree", "prompt_plain"
+        ),
+    }
+    atomic_json(output_dir / "summary.json", summary)
+    run_question_quality_analysis(turns_path, output_dir / "quality_analysis")
+    return summary
 
 
 # =============================================================================
@@ -1483,6 +2150,51 @@ def quality_metric_stats(values: Sequence[float], prefix: str) -> Dict[str, floa
     }
 
 
+def quality_value(row: Mapping, metric: str) -> float:
+    if metric in row:
+        return float(row[metric])
+    scores = row["question_quality_scores"]
+    if metric in scores:
+        return float(scores[metric])
+    if metric == "general_question_quality":
+        return quality_mean([float(scores[name]) for name in GENERAL_QUALITY_DIMENSIONS])
+    if metric == "adaptive_diagnostic_quality":
+        return quality_mean([float(scores[name]) for name in ADAPTIVE_QUALITY_DIMENSIONS])
+    if metric == "overall_question_quality":
+        return quality_mean([float(scores[name]) for name in QUESTION_QUALITY_DIMENSIONS])
+    raise KeyError(metric)
+
+
+def judge_detail_value(detail: Mapping, metric: str) -> float:
+    if metric in QUESTION_QUALITY_DIMENSIONS:
+        return float(detail[metric])
+    if metric == "general_question_quality":
+        return quality_mean([float(detail[name]) for name in GENERAL_QUALITY_DIMENSIONS])
+    if metric == "adaptive_diagnostic_quality":
+        return quality_mean([float(detail[name]) for name in ADAPTIVE_QUALITY_DIMENSIONS])
+    if metric == "overall_question_quality":
+        return quality_mean([float(detail[name]) for name in QUESTION_QUALITY_DIMENSIONS])
+    raise KeyError(metric)
+
+
+def judge_repeat_icc(ratings: Sequence[Sequence[float]]) -> float:
+    """One-way random-effects ICC(1,1) across repeated blind judge calls."""
+    matrix = [list(map(float, row)) for row in ratings if len(row) >= 2]
+    if len(matrix) < 2:
+        return float("nan")
+    repeats = min(len(row) for row in matrix)
+    matrix = [row[:repeats] for row in matrix]
+    row_means = [quality_mean(row) for row in matrix]
+    grand = quality_mean([value for row in matrix for value in row])
+    between_ms = repeats * sum((value - grand) ** 2 for value in row_means) / (len(matrix) - 1)
+    within_ms = sum(
+        (value - row_mean) ** 2
+        for row, row_mean in zip(matrix, row_means) for value in row
+    ) / (len(matrix) * (repeats - 1))
+    denominator = between_ms + (repeats - 1) * within_ms
+    return (between_ms - within_ms) / denominator if denominator > _EPS else 0.0
+
+
 def first_attempt_quality(row: Mapping) -> float:
     attempts = row["question_generation_attempts"]
     if not attempts:
@@ -1508,7 +2220,11 @@ def summarize_quality_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
         values = [float(row["question_quality_scores"][name]) for row in rows]
         result.update(quality_metric_stats(values, name))
 
-    overall = [float(row["overall_question_quality"]) for row in rows]
+    for name in COMPOSITE_QUALITY_METRICS:
+        values = [quality_value(row, name) for row in rows]
+        result.update(quality_metric_stats(values, name))
+
+    overall = [quality_value(row, "overall_question_quality") for row in rows]
     first = [first_attempt_quality(row) for row in rows]
     thresholds = [float(row.get("quality_threshold", 7.0)) for row in rows]
     regenerations = [int(row["regeneration_count"]) for row in rows]
@@ -1518,21 +2234,26 @@ def summarize_quality_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
         for row, score, threshold in zip(rows, overall, thresholds)
     ]
     gate_enabled = [bool(row.get("quality_gate_enabled", True)) for row in rows]
-    result.update(quality_metric_stats(overall, "overall_question_quality"))
     result.update(quality_metric_stats(first, "first_attempt_overall_quality"))
 
-    within_question_std = []
-    for row in rows:
-        details = row["question_generation_attempts"][-1].get(
-            "question_judge_details", []
+    repeat_metrics = (*active_dimensions, *COMPOSITE_QUALITY_METRICS)
+    for metric in repeat_metrics:
+        per_question = []
+        for row in rows:
+            details = row["question_generation_attempts"][-1].get(
+                "question_judge_details", []
+            )
+            ratings = [
+                judge_detail_value(detail, metric) for detail in details
+                if all(name in detail for name in QUESTION_QUALITY_DIMENSIONS)
+            ]
+            if ratings:
+                per_question.append(ratings)
+        result[f"{metric}_mean_judge_repeat_std"] = (
+            quality_mean([quality_sample_std(values) for values in per_question])
+            if per_question else 0.0
         )
-        repeated_overall = [
-            quality_mean([float(detail[name]) for name in active_dimensions])
-            for detail in details
-            if active_dimensions and all(name in detail for name in active_dimensions)
-        ]
-        if repeated_overall:
-            within_question_std.append(quality_sample_std(repeated_overall))
+        result[f"{metric}_judge_icc_1_1"] = judge_repeat_icc(per_question)
 
     result.update({
         "first_attempt_pass_rate": quality_mean([
@@ -1560,8 +2281,8 @@ def summarize_quality_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
             ))
             for row in rows
         ]),
-        "average_within_question_judge_std": (
-            quality_mean(within_question_std) if within_question_std else 0.0
+        "average_within_question_judge_std": result.get(
+            "overall_question_quality_mean_judge_repeat_std", 0.0
         ),
     })
     if all("realized_job_variance_reduction" in row for row in rows):
@@ -1610,43 +2331,65 @@ def quality_bootstrap_ci(
 def paired_question_quality_comparison(
     rows: Sequence[Mapping], first: str = "bridge", second: str = "random"
 ) -> Dict:
-    candidate_values: Dict[Tuple[str, object], List[float]] = defaultdict(list)
+    candidate_rows: Dict[Tuple[str, object], List[Mapping]] = defaultdict(list)
     for row in rows:
-        candidate_values[(str(row["strategy"]), row["candidate_id"])].append(
-            float(row["overall_question_quality"])
-        )
+        candidate_rows[(str(row["strategy"]), row["candidate_id"])].append(row)
     first_ids = {
-        candidate_id for strategy, candidate_id in candidate_values
+        candidate_id for strategy, candidate_id in candidate_rows
         if strategy == first
     }
     second_ids = {
-        candidate_id for strategy, candidate_id in candidate_values
+        candidate_id for strategy, candidate_id in candidate_rows
         if strategy == second
     }
     common = sorted(first_ids & second_ids, key=str)
-    deltas = [
-        quality_mean(candidate_values[(first, candidate_id)])
-        - quality_mean(candidate_values[(second, candidate_id)])
-        for candidate_id in common
-    ]
-    if not deltas:
+    if not common:
         return {
             "available": False,
             "reason": f"No candidates shared by {first} and {second}",
         }
-    ci_low, ci_high = quality_bootstrap_ci(deltas)
-    delta_std = quality_sample_std(deltas)
+    metric_results = {}
+    for metric in (*QUESTION_QUALITY_DIMENSIONS, *COMPOSITE_QUALITY_METRICS):
+        deltas = [
+            quality_mean([quality_value(row, metric) for row in candidate_rows[(first, candidate_id)]])
+            - quality_mean([quality_value(row, metric) for row in candidate_rows[(second, candidate_id)]])
+            for candidate_id in common
+        ]
+        ci_low, ci_high = quality_bootstrap_ci(
+            deltas, seed=stable_seed("paired-quality", first, second, metric)
+        )
+        delta_std = quality_sample_std(deltas)
+        metric_results[metric] = {
+            "first_candidate_mean": quality_mean([
+                quality_mean([quality_value(row, metric) for row in candidate_rows[(first, candidate_id)]])
+                for candidate_id in common
+            ]),
+            "second_candidate_mean": quality_mean([
+                quality_mean([quality_value(row, metric) for row in candidate_rows[(second, candidate_id)]])
+                for candidate_id in common
+            ]),
+            "mean_delta": quality_mean(deltas),
+            "bootstrap_95_ci_low": ci_low,
+            "bootstrap_95_ci_high": ci_high,
+            "paired_effect_size_dz": quality_mean(deltas) / delta_std if delta_std > 0 else 0.0,
+            "first_win_rate": quality_mean([float(value > _EPS) for value in deltas]),
+            "tie_rate": quality_mean([float(abs(value) <= _EPS) for value in deltas]),
+            "first_loss_rate": quality_mean([float(value < -_EPS) for value in deltas]),
+        }
+    overall = metric_results["overall_question_quality"]
     return {
         "available": True,
         "comparison": f"{first}_minus_{second}",
         "unit": "candidate mean across turns",
-        "n_paired_candidates": len(deltas),
-        "mean_overall_quality_delta": quality_mean(deltas),
-        "bootstrap_95_ci_low": ci_low,
-        "bootstrap_95_ci_high": ci_high,
-        "paired_effect_size_dz": quality_mean(deltas) / delta_std if delta_std > 0 else 0.0,
-        "first_win_rate": quality_mean([float(value > 0) for value in deltas]),
-        "tie_rate": quality_mean([float(value == 0) for value in deltas]),
+        "n_paired_candidates": len(common),
+        "metrics": metric_results,
+        "mean_overall_quality_delta": overall["mean_delta"],
+        "bootstrap_95_ci_low": overall["bootstrap_95_ci_low"],
+        "bootstrap_95_ci_high": overall["bootstrap_95_ci_high"],
+        "paired_effect_size_dz": overall["paired_effect_size_dz"],
+        "first_win_rate": overall["first_win_rate"],
+        "tie_rate": overall["tie_rate"],
+        "first_loss_rate": overall["first_loss_rate"],
         "note": (
             "Strategies select different skills and difficulties, so this paired delta "
             "measures end-to-end sequence quality rather than generator quality alone."
@@ -1664,6 +2407,8 @@ def flatten_quality_turn(row: Mapping) -> Dict:
         "difficulty": row["difficulty"],
         "question": row["question"],
         "overall_question_quality": row["overall_question_quality"],
+        "general_question_quality": quality_value(row, "general_question_quality"),
+        "adaptive_diagnostic_quality": quality_value(row, "adaptive_diagnostic_quality"),
         "first_attempt_overall_quality": first_attempt_quality(row),
         "quality_threshold": row.get("quality_threshold", 7.0),
         "quality_threshold_met": row.get("quality_threshold_met", ""),
@@ -1695,24 +2440,64 @@ def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
     by_strategy = grouped_quality_summaries(rows, ["strategy"])
     by_difficulty = grouped_quality_summaries(rows, ["strategy", "difficulty"])
     by_cluster = grouped_quality_summaries(rows, ["strategy", "cluster"])
-    comparison = paired_question_quality_comparison(rows)
+    by_branch = grouped_quality_summaries(rows, ["strategy", "branch"]) if all(
+        "branch" in row for row in rows
+    ) else []
+    available_strategies = {str(row["strategy"]) for row in rows}
+    comparison_pairs = [
+        pair for pair in (
+            ("bridge", "random"),
+            ("tree_bridge", "tree_random"),
+            ("tree_bridge", "flat_bridge"),
+            ("tree_bridge", "independent_bridge"),
+            ("prompt_tree", "prompt_plain"),
+        )
+        if set(pair).issubset(available_strategies)
+    ]
+    comparisons = {
+        f"{first}_vs_{second}": paired_question_quality_comparison(rows, first, second)
+        for first, second in comparison_pairs
+    }
+    primary_key = next(iter(comparisons), None)
+    comparison = comparisons[primary_key] if primary_key else {
+        "available": False,
+        "reason": "No configured paired strategy comparison is present",
+    }
+    bridge_random = comparisons.get("bridge_vs_random", {
+        "available": False,
+        "reason": "bridge and random are not both present",
+    })
     report = {
         "input": str(input_path.resolve()),
         "n_records": len(rows),
         "strategies": sorted({row["strategy"] for row in rows}),
         "overall": summarize_quality_rows(rows),
         "by_strategy": by_strategy,
-        "bridge_vs_random": comparison,
+        "bridge_vs_random": bridge_random,
+        "primary_paired_comparison": comparison,
+        "paired_comparisons": comparisons,
         "interpretation_notes": [
             "Question-quality scores never enter BayesianAbilityModel.",
             "Turns from the same candidate are repeated measures; candidate means are paired.",
             "Different strategies select different skill/difficulty mixtures; inspect stratified CSV files.",
+            "Fixed-target prompt_tree vs prompt_plain rows hold path, difficulty, history, and state constant.",
         ],
     }
     atomic_json(output_dir / "question_quality_summary.json", report)
     write_quality_csv(output_dir / "question_quality_by_strategy.csv", by_strategy)
     write_quality_csv(output_dir / "question_quality_by_difficulty.csv", by_difficulty)
     write_quality_csv(output_dir / "question_quality_by_cluster.csv", by_cluster)
+    write_quality_csv(output_dir / "question_quality_by_branch.csv", by_branch)
+    paired_rows = []
+    for comparison_name, paired in comparisons.items():
+        for metric, values in paired.get("metrics", {}).items():
+            paired_rows.append({
+                "comparison": comparison_name,
+                "metric": metric,
+                "n_paired_candidates": paired["n_paired_candidates"],
+                **values,
+            })
+    write_quality_csv(output_dir / "paired_quality_comparisons.csv", paired_rows)
     write_quality_csv(
         output_dir / "question_quality_turns.csv",
         [flatten_quality_turn(row) for row in rows],
@@ -1722,6 +2507,8 @@ def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
         print(
             f"{row['strategy']}: n={row['n_turns']}, "
             f"overall={row['overall_question_quality_mean']:.4f}, "
+            f"general={row['general_question_quality_mean']:.4f}, "
+            f"adaptive={row['adaptive_diagnostic_quality_mean']:.4f}, "
             f"below_threshold={row['below_threshold_rate']:.4f}"
         )
     print("\nPaired comparison")
@@ -1742,7 +2529,9 @@ def print_compact(title: str, result: Dict) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", choices=["exp1", "exp2", "qwen", "analyze", "all"],
+        "--mode", choices=[
+            "exp1", "exp2", "qwen", "prompt_ablation", "analyze", "all",
+        ],
         default="all",
     )
     parser.add_argument("--output", default="runs", help="Output root directory")
@@ -1763,8 +2552,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategies",
         nargs="+",
-        choices=["bridge", "uncertainty", "random", "fixed"],
-        default=["bridge", "uncertainty", "random", "fixed"],
+        choices=list(STRATEGY_SPECS),
+        default=["tree_bridge", "flat_bridge", "independent_bridge", "tree_random"],
     )
 
     parser.add_argument(
@@ -1815,7 +2604,8 @@ def main() -> None:
         "git_sha": git_sha(),
         "command": sys.argv,
         "scale": "[1,10]",
-        "skill_clusters": {name: list(skills) for name, skills in SKILL_CLUSTERS.items()},
+        "capability_tree": CAPABILITY_TREE,
+        "tree_shape": {"root": 1, "domains": 9, "subcapabilities": 27, "leaves": 108},
         "note": "--mode all runs only synthetic Exp. 1 and Exp. 2; Qwen is explicit.",
     }
     atomic_json(output_root / "manifest.json", manifest)
@@ -1835,7 +2625,7 @@ def main() -> None:
         )
         print_compact("Exp. 2 complete", result)
 
-    if args.mode == "qwen":
+    if args.mode in ("qwen", "prompt_ablation"):
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
             raise SystemExit(
@@ -1850,37 +2640,40 @@ def main() -> None:
         question_attempts = (
             args.max_regenerations + 1 if args.regenerate_low_quality else 1
         )
-        calls_per_turn = (
-            question_attempts * (1 + args.question_judge_repeats)
-            + 1
-        )
-        estimated_calls = (
-            args.qwen_candidates
-            * len(args.strategies)
-            * args.qwen_questions
-            * calls_per_turn
-        )
+        if args.mode == "qwen":
+            calls_per_turn = question_attempts * (1 + args.question_judge_repeats) + 1
+            estimated_calls = (
+                args.qwen_candidates * len(args.strategies)
+                * args.qwen_questions * calls_per_turn
+            )
+        else:
+            calls_per_pair = 2 * question_attempts * (1 + args.question_judge_repeats) + 1
+            estimated_calls = args.qwen_candidates * args.qwen_questions * calls_per_pair
         print(f"Estimated planned API calls (excluding network/format retries): {estimated_calls}")
         if not args.confirm_api_calls:
             raise SystemExit("Re-run with --confirm-api-calls after checking the estimated cost")
-        result = run_qwen(
-            output_root=output_root,
-            api_key=api_key,
-            base_url=args.base_url,
-            question_model=args.question_model,
-            question_judge_model=args.question_judge_model,
-            candidate_model=args.candidate_model,
-            n_candidates=args.qwen_candidates,
-            questions=args.qwen_questions,
-            strategies=args.strategies,
-            question_judge_repeats=args.question_judge_repeats,
-            quality_threshold=args.quality_threshold,
-            max_regenerations=args.max_regenerations,
-            regenerate_low_quality=args.regenerate_low_quality,
-            seed=args.seed,
-            request_delay=args.request_delay,
-        )
-        print_compact("Qwen pilot complete", result)
+        common = {
+            "output_root": output_root,
+            "api_key": api_key,
+            "base_url": args.base_url,
+            "question_model": args.question_model,
+            "question_judge_model": args.question_judge_model,
+            "candidate_model": args.candidate_model,
+            "n_candidates": args.qwen_candidates,
+            "questions": args.qwen_questions,
+            "question_judge_repeats": args.question_judge_repeats,
+            "quality_threshold": args.quality_threshold,
+            "max_regenerations": args.max_regenerations,
+            "regenerate_low_quality": args.regenerate_low_quality,
+            "seed": args.seed,
+            "request_delay": args.request_delay,
+        }
+        if args.mode == "qwen":
+            result = run_qwen(strategies=args.strategies, **common)
+            print_compact("Qwen pilot complete", result)
+        else:
+            result = run_prompt_ablation(**common)
+            print_compact("Fixed-target prompt ablation complete", result)
 
 
 if __name__ == "__main__":
