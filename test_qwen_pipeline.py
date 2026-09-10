@@ -120,6 +120,20 @@ class QwenPipelineTest(unittest.TestCase):
                 self.assertEqual(len(FakeDashScopeHandler.calls), calls_after_first)
                 self.assertIn("18/18", second.stderr)
                 self.assertIn("Qwen pilot complete", first.stdout)
+
+                analysis = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "analyze_question_quality.py"),
+                        "--input", str(turns_path),
+                    ],
+                    cwd=ROOT, text=True, capture_output=True, check=True,
+                )
+                analysis_path = turns_path.parent / "quality_analysis" / "question_quality_summary.json"
+                report = json.loads(analysis_path.read_text(encoding="utf-8"))
+                self.assertEqual(report["n_records"], 18)
+                self.assertTrue(report["bridge_vs_random"]["available"])
+                self.assertIn("Question quality by strategy", analysis.stdout)
         finally:
             server.shutdown()
             server.server_close()
