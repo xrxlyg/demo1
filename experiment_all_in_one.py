@@ -1224,6 +1224,7 @@ def build_question_context(
     ability_model: BayesianAbilityModel,
     skill: str,
     selector: Mapping[str, float],
+    dialogue_history: Sequence[Mapping] = (),
 ) -> Dict:
     posterior_mean = ability_model.skill_mean(skill)
     posterior_std = math.sqrt(ability_model.skill_variance(skill))
@@ -1238,26 +1239,24 @@ def build_question_context(
         name for name in CAPABILITY_TREE[SKILL_TO_CLUSTER[skill]][SKILL_TO_BRANCH[skill]]
         if name != skill
     ]
-    sibling_posteriors = [
+    sibling_posteriors = sorted([
         {
             "skill": name,
             "posterior_mean": ability_model.skill_mean(name),
             "posterior_std": math.sqrt(ability_model.skill_variance(name)),
         }
         for name in siblings
-    ]
-    evidence = sorted(
-        (
-            {
-                "skill": name,
-                "observations": count,
-                "posterior_mean": ability_model.skill_mean(name),
-                "posterior_std": math.sqrt(ability_model.skill_variance(name)),
-            }
-            for name, count in ability_model.observations.items() if count > 0
-        ),
-        key=lambda row: (-int(row["observations"]), str(row["skill"])),
-    )[:12]
+    ], key=lambda row: (-float(row["posterior_std"]), str(row["skill"])))[:2]
+    evidence = []
+    for row in list(dialogue_history)[-2:]:
+        observed_skill = str(row["skill"])
+        evidence.append({
+            "skill": observed_skill,
+            "observed_score": row.get("ability_observation_score"),
+            "observation_std": row.get("ability_observation_std"),
+            "posterior_mean": ability_model.skill_mean(observed_skill),
+            "posterior_std": math.sqrt(ability_model.skill_variance(observed_skill)),
+        })
     weaknesses = sorted(
         (
             {
@@ -1265,10 +1264,11 @@ def build_question_context(
                 "posterior_mean": ability_model.skill_mean(name),
                 "posterior_std": math.sqrt(ability_model.skill_variance(name)),
             }
-            for name in SKILLS
+            for name in CAPABILITY_TREE[SKILL_TO_CLUSTER[skill]][SKILL_TO_BRANCH[skill]]
+            if name != skill
         ),
         key=lambda row: (float(row["posterior_mean"]), -float(row["posterior_std"])),
-    )[:5]
+    )[:2]
     _propagation, policy = strategy_spec(strategy)
     return {
         "skill": skill,
@@ -1290,8 +1290,8 @@ def build_question_context(
         "selection_utility": selector["utility"],
         "diagnostic_goal": boundary,
         "diagnostic_hypothesis": (
-            f"A targeted question on {skill} should {boundary}; evidence from "
-            f"nearby abilities remains {'sparse' if not evidence else 'partially observed'}."
+            f"围绕 {skill} 设计一个问题，用于{boundary}；"
+            f"当前相邻能力证据{'不足' if not evidence else '仅部分可用'}。"
         ),
         "propagation": ability_model.propagation,
         "prompt_variant": (
@@ -1312,12 +1312,12 @@ def generate_qwen_question(
     question_context: Mapping,
 ) -> str:
     """Generate one interview question; the returned value is the raw model text."""
-    history = list(dialogue_history)[-3:]
+    history = list(dialogue_history)[-1:]
     history_text = "\n".join(
         f"第{row['turn'] + 1}轮：问题：{row['question']} 回答：{row['answer']}"
         for row in history
     ) or "无，这是第一轮。"
-    previous_questions = [row["question"] for row in dialogue_history]
+    previous_questions = [row["question"] for row in dialogue_history[-6:]]
     rejected_text = "\n".join(
         f"- 问题：{row['question']}；评审反馈：{row['feedback']}"
         for row in rejected_attempts
@@ -1329,7 +1329,8 @@ def generate_qwen_question(
     }[difficulty]
     system = (
         "你是技术面试问题生成器。只生成一个中文问题，不要给答案、解释、标题、"
-        "评分或Markdown。问题必须聚焦指定技能，符合难度，并与对话自然衔接。"
+        "评分或Markdown。问题最多两句话，只包含一个主要任务，必须聚焦指定技能、"
+        "符合难度，并与上一轮回答存在明确证据时才自然衔接。"
     )
     user_parts = [
         f"目标能力路径：{' → '.join(question_context['capability_path'])}\n"
@@ -1338,18 +1339,36 @@ def generate_qwen_question(
         f"全部历史问题：{json.dumps(previous_questions, ensure_ascii=False)}\n"
     ]
     if question_context["prompt_variant"] == "bridge_adaptive":
+        path_text = "\n".join(
+            f"  L{row['level']} {row['label']}: "
+            f"均值={row['posterior_mean']:.2f}, 标准差={row['posterior_std']:.2f}"
+            for row in question_context["path_posteriors"]
+        )
+        sibling_text = "; ".join(
+            f"{row['skill']}({row['posterior_mean']:.2f}±{row['posterior_std']:.2f})"
+            for row in question_context["sibling_posteriors"]
+        ) or "无"
+        evidence_text = "; ".join(
+            f"{row['skill']}: 观测={row['observed_score']}, "
+            f"后验={row['posterior_mean']:.2f}±{row['posterior_std']:.2f}"
+            for row in question_context["observed_evidence"]
+        ) or "无"
+        weakness_text = "; ".join(
+            f"{row['skill']}({row['posterior_mean']:.2f}±{row['posterior_std']:.2f})"
+            for row in question_context["weaknesses"]
+        ) or "无"
         user_parts.append(
             "分层BRIDGE诊断上下文：\n"
-            f"- 各层后验：{json.dumps(question_context['path_posteriors'], ensure_ascii=False)}\n"
-            f"- 兄弟技能后验：{json.dumps(question_context['sibling_posteriors'], ensure_ascii=False)}\n"
-            f"- 已观察证据：{json.dumps(question_context['observed_evidence'], ensure_ascii=False)}\n"
-            f"- 当前能力薄弱点：{json.dumps(question_context['weaknesses'], ensure_ascii=False)}\n"
+            f"- 四层后验：\n{path_text}\n"
+            f"- 最相关兄弟技能：{sibling_text}\n"
+            f"- 最近两条能力证据：{evidence_text}\n"
+            f"- 当前分支薄弱点：{weakness_text}\n"
             f"- 当前诊断假设：{question_context['diagnostic_hypothesis']}\n"
             f"- 预期岗位方差下降：{question_context['decision_variance_reduction']:.6f}\n"
             f"- 预期分支方差下降：{question_context['hierarchy_variance_reduction']:.6f}\n"
             f"- 诊断目标：{question_context['diagnostic_goal']}\n"
-            "请设计一个能在当前最可能的能力状态之间形成可观察答案差异的问题，"
-            "不要只生成普通的技能知识题。\n"
+            "只利用最相关信息，设计一个能区分当前两种最可能能力状态的问题；"
+            "避免罗列多个子问题，也不要机械复述上述数值。\n"
         )
     user_parts.append(
         f"本轮已被拒绝的尝试（必须针对反馈改写且避免重复）：\n{rejected_text}\n"
@@ -1680,7 +1699,11 @@ def run_qwen(
                         strategy, model, recent, turn, seed, profile.candidate_id
                     )
                     question_context = build_question_context(
-                        strategy, model, skill, components
+                        strategy,
+                        model,
+                        skill,
+                        components,
+                        grouped[(strategy, profile.candidate_id)],
                     )
                     job_variance_before = model.job_variance()
                     total_variance_before = model.total_variance()
@@ -1977,7 +2000,9 @@ def run_prompt_ablation(
                 components = model.risk_components(skill, difficulty, [
                     row["skill"] for row in shared_history[-6:]
                 ])
-                base_context = build_question_context("bridge", model, skill, components)
+                base_context = build_question_context(
+                    "bridge", model, skill, components, shared_history
+                )
                 history_hash = hashlib.sha256(
                     json.dumps(shared_history, ensure_ascii=False, sort_keys=True).encode("utf-8")
                 ).hexdigest()
@@ -2391,8 +2416,12 @@ def paired_question_quality_comparison(
         "tie_rate": overall["tie_rate"],
         "first_loss_rate": overall["first_loss_rate"],
         "note": (
-            "Strategies select different skills and difficulties, so this paired delta "
-            "measures end-to-end sequence quality rather than generator quality alone."
+            "Both prompt variants use the same capability path, skill, difficulty, "
+            "posterior state, dialogue history, and candidate state."
+            if (first, second) == ("prompt_tree", "prompt_plain")
+            else "Strategies select different skills and difficulties, so this paired "
+                 "delta measures end-to-end sequence quality rather than generator "
+                 "quality alone."
         ),
     }
 
