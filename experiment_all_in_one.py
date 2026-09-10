@@ -16,6 +16,7 @@ Examples:
   python experiment_all_in_one.py --mode exp1 --output runs
   python experiment_all_in_one.py --mode exp2 --seeds 20 --output runs
   python experiment_all_in_one.py --mode all  --seeds 20 --output runs
+  python experiment_all_in_one.py --mode analyze --output runs
 
 Qwen calls are never included in --mode all.  They require an explicit mode:
   export DASHSCOPE_API_KEY=...
@@ -1433,6 +1434,303 @@ def run_qwen(
 
 
 # =============================================================================
+# Question-quality analysis (kept here so the experiment needs one Python file)
+# =============================================================================
+
+def load_question_quality_jsonl(path: Path) -> List[Dict]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Input JSONL not found: {path}")
+    rows = []
+    with path.open(encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON at line {line_number}: {exc}") from exc
+            required = (
+                "strategy", "candidate_id", "turn", "difficulty", "cluster",
+                "question", "question_quality_scores", "overall_question_quality",
+                "regeneration_count", "question_generation_attempts",
+            )
+            missing = [name for name in required if name not in row]
+            if missing:
+                raise ValueError(
+                    f"Line {line_number} is not a question-quality record; "
+                    f"missing {missing}"
+                )
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"No records found in {path}")
+    return rows
+
+
+def quality_mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
+
+
+def quality_sample_std(values: Sequence[float]) -> float:
+    return statistics.stdev(values) if len(values) > 1 else 0.0
+
+
+def quality_metric_stats(values: Sequence[float], prefix: str) -> Dict[str, float]:
+    return {
+        f"{prefix}_mean": quality_mean(values),
+        f"{prefix}_std": quality_sample_std(values),
+        f"{prefix}_min": min(values),
+        f"{prefix}_max": max(values),
+    }
+
+
+def first_attempt_quality(row: Mapping) -> float:
+    attempts = row["question_generation_attempts"]
+    if not attempts:
+        raise ValueError("question_generation_attempts cannot be empty")
+    return float(attempts[0]["quality_scores"]["overall_question_quality"])
+
+
+def question_judge_call_count(row: Mapping) -> int:
+    return sum(
+        1 + int(detail.get("format_retry_count", 0))
+        for attempt in row["question_generation_attempts"]
+        for detail in attempt.get("question_judge_details", [])
+    )
+
+
+def summarize_quality_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
+    result: Dict[str, float] = {"n_turns": len(rows)}
+    active_dimensions = [
+        name for name in QUESTION_QUALITY_DIMENSIONS
+        if all(name in row["question_quality_scores"] for row in rows)
+    ]
+    for name in active_dimensions:
+        values = [float(row["question_quality_scores"][name]) for row in rows]
+        result.update(quality_metric_stats(values, name))
+
+    overall = [float(row["overall_question_quality"]) for row in rows]
+    first = [first_attempt_quality(row) for row in rows]
+    thresholds = [float(row.get("quality_threshold", 7.0)) for row in rows]
+    regenerations = [int(row["regeneration_count"]) for row in rows]
+    attempts = [len(row["question_generation_attempts"]) for row in rows]
+    final_pass = [
+        bool(row.get("quality_threshold_met", score >= threshold))
+        for row, score, threshold in zip(rows, overall, thresholds)
+    ]
+    gate_enabled = [bool(row.get("quality_gate_enabled", True)) for row in rows]
+    result.update(quality_metric_stats(overall, "overall_question_quality"))
+    result.update(quality_metric_stats(first, "first_attempt_overall_quality"))
+
+    within_question_std = []
+    for row in rows:
+        details = row["question_generation_attempts"][-1].get(
+            "question_judge_details", []
+        )
+        repeated_overall = [
+            quality_mean([float(detail[name]) for name in active_dimensions])
+            for detail in details
+            if active_dimensions and all(name in detail for name in active_dimensions)
+        ]
+        if repeated_overall:
+            within_question_std.append(quality_sample_std(repeated_overall))
+
+    result.update({
+        "first_attempt_pass_rate": quality_mean([
+            float(score >= threshold) for score, threshold in zip(first, thresholds)
+        ]),
+        "final_pass_rate": quality_mean([float(value) for value in final_pass]),
+        "below_threshold_rate": quality_mean([float(not value) for value in final_pass]),
+        "quality_gate_enabled_rate": quality_mean([float(value) for value in gate_enabled]),
+        "exhausted_failure_rate": quality_mean([
+            float(enabled and not passed)
+            for enabled, passed in zip(gate_enabled, final_pass)
+        ]),
+        "no_regeneration_rate": quality_mean([
+            float(value == 0) for value in regenerations
+        ]),
+        "average_regeneration_count": quality_mean(regenerations),
+        "average_generation_attempts": quality_mean(attempts),
+        "average_question_judge_api_calls": quality_mean([
+            question_judge_call_count(row) for row in rows
+        ]),
+        "format_retry_turn_rate": quality_mean([
+            float(question_judge_call_count(row) > sum(
+                len(attempt.get("question_judge_details", []))
+                for attempt in row["question_generation_attempts"]
+            ))
+            for row in rows
+        ]),
+        "average_within_question_judge_std": (
+            quality_mean(within_question_std) if within_question_std else 0.0
+        ),
+    })
+    if all("realized_job_variance_reduction" in row for row in rows):
+        reductions = [float(row["realized_job_variance_reduction"]) for row in rows]
+        result["average_realized_job_variance_reduction"] = quality_mean(reductions)
+        result["total_realized_job_variance_reduction"] = sum(reductions)
+    return result
+
+
+def grouped_quality_summaries(
+    rows: Sequence[Mapping], keys: Sequence[str]
+) -> List[Dict]:
+    groups: Dict[Tuple, List[Mapping]] = defaultdict(list)
+    for row in rows:
+        groups[tuple(row[key] for key in keys)].append(row)
+    results = []
+    for group_key in sorted(groups, key=lambda value: tuple(map(str, value))):
+        summary = {key: value for key, value in zip(keys, group_key)}
+        summary.update(summarize_quality_rows(groups[group_key]))
+        results.append(summary)
+    return results
+
+
+def quality_percentile(sorted_values: Sequence[float], probability: float) -> float:
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = probability * (len(sorted_values) - 1)
+    lower, upper = math.floor(position), math.ceil(position)
+    if lower == upper:
+        return sorted_values[lower]
+    weight = position - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def quality_bootstrap_ci(
+    values: Sequence[float], repeats: int = 10000, seed: int = 42
+) -> Tuple[float, float]:
+    rng = random.Random(seed)
+    boot = sorted(
+        quality_mean([rng.choice(values) for _ in values])
+        for _ in range(repeats)
+    )
+    return quality_percentile(boot, 0.025), quality_percentile(boot, 0.975)
+
+
+def paired_question_quality_comparison(
+    rows: Sequence[Mapping], first: str = "bridge", second: str = "random"
+) -> Dict:
+    candidate_values: Dict[Tuple[str, object], List[float]] = defaultdict(list)
+    for row in rows:
+        candidate_values[(str(row["strategy"]), row["candidate_id"])].append(
+            float(row["overall_question_quality"])
+        )
+    first_ids = {
+        candidate_id for strategy, candidate_id in candidate_values
+        if strategy == first
+    }
+    second_ids = {
+        candidate_id for strategy, candidate_id in candidate_values
+        if strategy == second
+    }
+    common = sorted(first_ids & second_ids, key=str)
+    deltas = [
+        quality_mean(candidate_values[(first, candidate_id)])
+        - quality_mean(candidate_values[(second, candidate_id)])
+        for candidate_id in common
+    ]
+    if not deltas:
+        return {
+            "available": False,
+            "reason": f"No candidates shared by {first} and {second}",
+        }
+    ci_low, ci_high = quality_bootstrap_ci(deltas)
+    delta_std = quality_sample_std(deltas)
+    return {
+        "available": True,
+        "comparison": f"{first}_minus_{second}",
+        "unit": "candidate mean across turns",
+        "n_paired_candidates": len(deltas),
+        "mean_overall_quality_delta": quality_mean(deltas),
+        "bootstrap_95_ci_low": ci_low,
+        "bootstrap_95_ci_high": ci_high,
+        "paired_effect_size_dz": quality_mean(deltas) / delta_std if delta_std > 0 else 0.0,
+        "first_win_rate": quality_mean([float(value > 0) for value in deltas]),
+        "tie_rate": quality_mean([float(value == 0) for value in deltas]),
+        "note": (
+            "Strategies select different skills and difficulties, so this paired delta "
+            "measures end-to-end sequence quality rather than generator quality alone."
+        ),
+    }
+
+
+def flatten_quality_turn(row: Mapping) -> Dict:
+    flattened = {
+        "strategy": row["strategy"],
+        "candidate_id": row["candidate_id"],
+        "turn": row["turn"],
+        "skill": row.get("skill", ""),
+        "cluster": row["cluster"],
+        "difficulty": row["difficulty"],
+        "question": row["question"],
+        "overall_question_quality": row["overall_question_quality"],
+        "first_attempt_overall_quality": first_attempt_quality(row),
+        "quality_threshold": row.get("quality_threshold", 7.0),
+        "quality_threshold_met": row.get("quality_threshold_met", ""),
+        "regeneration_count": row["regeneration_count"],
+        "generation_attempts": len(row["question_generation_attempts"]),
+        "question_judge_api_calls": question_judge_call_count(row),
+    }
+    flattened.update({
+        name: row["question_quality_scores"][name]
+        for name in QUESTION_QUALITY_DIMENSIONS
+        if name in row["question_quality_scores"]
+    })
+    return flattened
+
+
+def write_quality_csv(path: Path, rows: Sequence[Mapping]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
+    rows = load_question_quality_jsonl(input_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    by_strategy = grouped_quality_summaries(rows, ["strategy"])
+    by_difficulty = grouped_quality_summaries(rows, ["strategy", "difficulty"])
+    by_cluster = grouped_quality_summaries(rows, ["strategy", "cluster"])
+    comparison = paired_question_quality_comparison(rows)
+    report = {
+        "input": str(input_path.resolve()),
+        "n_records": len(rows),
+        "strategies": sorted({row["strategy"] for row in rows}),
+        "overall": summarize_quality_rows(rows),
+        "by_strategy": by_strategy,
+        "bridge_vs_random": comparison,
+        "interpretation_notes": [
+            "Question-quality scores never enter BayesianAbilityModel.",
+            "Turns from the same candidate are repeated measures; candidate means are paired.",
+            "Different strategies select different skill/difficulty mixtures; inspect stratified CSV files.",
+        ],
+    }
+    atomic_json(output_dir / "question_quality_summary.json", report)
+    write_quality_csv(output_dir / "question_quality_by_strategy.csv", by_strategy)
+    write_quality_csv(output_dir / "question_quality_by_difficulty.csv", by_difficulty)
+    write_quality_csv(output_dir / "question_quality_by_cluster.csv", by_cluster)
+    write_quality_csv(
+        output_dir / "question_quality_turns.csv",
+        [flatten_quality_turn(row) for row in rows],
+    )
+    print("\nQuestion quality by strategy")
+    for row in by_strategy:
+        print(
+            f"{row['strategy']}: n={row['n_turns']}, "
+            f"overall={row['overall_question_quality_mean']:.4f}, "
+            f"below_threshold={row['below_threshold_rate']:.4f}"
+        )
+    print("\nPaired comparison")
+    print(json.dumps(comparison, ensure_ascii=False, indent=2))
+    print(f"\nSaved analysis to: {output_dir.resolve()}")
+    return report
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1443,8 +1741,21 @@ def print_compact(title: str, result: Dict) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["exp1", "exp2", "qwen", "all"], default="all")
+    parser.add_argument(
+        "--mode", choices=["exp1", "exp2", "qwen", "analyze", "all"],
+        default="all",
+    )
     parser.add_argument("--output", default="runs", help="Output root directory")
+    parser.add_argument(
+        "--analysis-input",
+        default=None,
+        help="turns.jsonl path; defaults to <output>/exp3_qwen/turns.jsonl",
+    )
+    parser.add_argument(
+        "--analysis-output",
+        default=None,
+        help="Analysis directory; defaults beside turns.jsonl as quality_analysis",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--candidates", type=int, default=30, help="Synthetic candidates per seed")
     parser.add_argument("--seeds", type=int, default=20, help="Number of Exp. 2 seeds")
@@ -1484,6 +1795,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     output_root = Path(args.output)
+    if args.mode == "analyze":
+        input_path = (
+            Path(args.analysis_input)
+            if args.analysis_input
+            else output_root / "exp3_qwen" / "turns.jsonl"
+        )
+        analysis_output = (
+            Path(args.analysis_output)
+            if args.analysis_output
+            else input_path.parent / "quality_analysis"
+        )
+        run_question_quality_analysis(input_path, analysis_output)
+        return
+
     output_root.mkdir(parents=True, exist_ok=True)
     manifest = {
         "created_at": utc_now(),
