@@ -143,8 +143,9 @@ class QwenPipelineTest(unittest.TestCase):
                 analysis = subprocess.run(
                     [
                         sys.executable,
-                        str(ROOT / "analyze_question_quality.py"),
-                        "--input", str(turns_path),
+                        str(ROOT / "experiment_all_in_one.py"),
+                        "--mode", "analyze",
+                        "--analysis-input", str(turns_path),
                     ],
                     cwd=ROOT, text=True, capture_output=True, check=True,
                 )
