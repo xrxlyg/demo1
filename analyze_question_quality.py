@@ -16,10 +16,13 @@ from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 DIMENSIONS = (
     "skill_relevance",
+    "technical_correctness",
     "difficulty_match",
     "clarity",
     "non_redundancy",
     "contextual_coherence",
+    "diagnostic_value",
+    "adaptive_relevance",
 )
 
 
@@ -87,7 +90,11 @@ def question_judge_calls(row: Mapping) -> int:
 
 def summarize_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
     result: Dict[str, float] = {"n_turns": len(rows)}
-    for dimension in DIMENSIONS:
+    active_dimensions = [
+        dimension for dimension in DIMENSIONS
+        if all(dimension in row["question_quality_scores"] for row in rows)
+    ]
+    for dimension in active_dimensions:
         values = [float(row["question_quality_scores"][dimension]) for row in rows]
         result.update(metric_stats(values, dimension))
 
@@ -103,6 +110,18 @@ def summarize_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
     gate_enabled = [bool(row.get("quality_gate_enabled", True)) for row in rows]
     result.update(metric_stats(overall, "overall_question_quality"))
     result.update(metric_stats(first, "first_attempt_overall_quality"))
+    within_question_judge_std = []
+    for row in rows:
+        details = row["question_generation_attempts"][-1].get(
+            "question_judge_details", []
+        )
+        repeated_overall = [
+            mean([float(detail[name]) for name in active_dimensions])
+            for detail in details
+            if all(name in detail for name in active_dimensions)
+        ]
+        if repeated_overall:
+            within_question_judge_std.append(sample_std(repeated_overall))
     result.update({
         "first_attempt_pass_rate": mean([
             float(score >= threshold) for score, threshold in zip(first, thresholds)
@@ -127,7 +146,14 @@ def summarize_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
             ))
             for row in rows
         ]),
+        "average_within_question_judge_std": (
+            mean(within_question_judge_std) if within_question_judge_std else 0.0
+        ),
     })
+    if all("realized_job_variance_reduction" in row for row in rows):
+        reductions = [float(row["realized_job_variance_reduction"]) for row in rows]
+        result["average_realized_job_variance_reduction"] = mean(reductions)
+        result["total_realized_job_variance_reduction"] = sum(reductions)
     return result
 
 
@@ -235,6 +261,7 @@ def flatten_turn(row: Mapping) -> Dict:
     flattened.update({
         dimension: row["question_quality_scores"][dimension]
         for dimension in DIMENSIONS
+        if dimension in row["question_quality_scores"]
     })
     return flattened
 
