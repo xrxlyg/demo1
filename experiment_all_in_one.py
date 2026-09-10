@@ -810,7 +810,16 @@ class QwenClient:
         timeout: float = 90.0,
         retries: int = 4,
     ) -> None:
-        self.api_key = api_key
+        self.api_key = api_key.strip()
+        if not self.api_key:
+            raise ValueError("DASHSCOPE_API_KEY is empty")
+        try:
+            self.api_key.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "DASHSCOPE_API_KEY must be the real ASCII API key; "
+                "do not use the Chinese placeholder '你的新API Key'"
+            ) from exc
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.timeout = timeout
         self.retries = retries
