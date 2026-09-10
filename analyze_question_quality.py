@@ -100,6 +100,7 @@ def summarize_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
         bool(row.get("quality_threshold_met", score >= threshold))
         for row, score, threshold in zip(rows, overall, thresholds)
     ]
+    gate_enabled = [bool(row.get("quality_gate_enabled", True)) for row in rows]
     result.update(metric_stats(overall, "overall_question_quality"))
     result.update(metric_stats(first, "first_attempt_overall_quality"))
     result.update({
@@ -107,7 +108,12 @@ def summarize_rows(rows: Sequence[Mapping]) -> Dict[str, float]:
             float(score >= threshold) for score, threshold in zip(first, thresholds)
         ]),
         "final_pass_rate": mean([float(value) for value in final_pass]),
-        "exhausted_failure_rate": mean([float(not value) for value in final_pass]),
+        "below_threshold_rate": mean([float(not value) for value in final_pass]),
+        "quality_gate_enabled_rate": mean([float(value) for value in gate_enabled]),
+        "exhausted_failure_rate": mean([
+            float(enabled and not passed)
+            for enabled, passed in zip(gate_enabled, final_pass)
+        ]),
         "no_regeneration_rate": mean([float(value == 0) for value in regenerations]),
         "average_regeneration_count": mean(regenerations),
         "average_generation_attempts": mean(attempts),
