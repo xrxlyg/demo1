@@ -24,7 +24,7 @@ Qwen calls are never included in --mode all.  They require an explicit mode:
       --candidate-model qwen-max --judge-model qwen-max \
       --qwen-candidates 30 --qwen-questions 12 \
       --strategies bridge random --question-judge-repeats 3 \
-      --quality-threshold 7 --max-regenerations 2 --judge-repeats 3 \
+      --quality-threshold 7 --judge-repeats 3 \
       --confirm-api-calls --output runs
 
 All abilities and evaluator scores use the [1, 10] scale.
@@ -1020,10 +1020,12 @@ def generate_qualified_question(
     judge_repeats: int,
     quality_threshold: float,
     max_regenerations: int,
+    regenerate_low_quality: bool,
 ) -> Tuple[str, Dict[str, float], int, List[Dict]]:
     attempts = []
     rejected = []
-    for attempt_index in range(max_regenerations + 1):
+    maximum_attempts = max_regenerations + 1 if regenerate_low_quality else 1
+    for attempt_index in range(maximum_attempts):
         raw_question = generate_qwen_question(
             client, question_model, skill, difficulty, dialogue_history, rejected
         )
@@ -1044,7 +1046,10 @@ def generate_qualified_question(
             "quality_scores": quality_scores,
             "question_judge_details": judge_details,
         })
-        if quality_scores["overall_question_quality"] >= quality_threshold:
+        if (
+            not regenerate_low_quality
+            or quality_scores["overall_question_quality"] >= quality_threshold
+        ):
             break
         rejected.append({
             "question": question,
@@ -1133,6 +1138,7 @@ def run_qwen(
     question_judge_repeats: int,
     quality_threshold: float,
     max_regenerations: int,
+    regenerate_low_quality: bool,
     judge_repeats: int,
     seed: int,
     request_delay: float,
@@ -1145,7 +1151,7 @@ def run_qwen(
     profiles = generate_profiles(n_candidates, seed)
 
     setup = {
-        "schema_version": 2,
+        "schema_version": 3,
         "seed": seed,
         "question_model": question_model,
         "question_judge_model": question_judge_model,
@@ -1154,6 +1160,7 @@ def run_qwen(
         "question_judge_repeats": question_judge_repeats,
         "quality_threshold": quality_threshold,
         "max_regenerations": max_regenerations,
+        "regenerate_low_quality": regenerate_low_quality,
         "judge_repeats": judge_repeats,
         "candidates": n_candidates,
         "questions": questions,
@@ -1229,6 +1236,7 @@ def run_qwen(
                             judge_repeats=question_judge_repeats,
                             quality_threshold=quality_threshold,
                             max_regenerations=max_regenerations,
+                            regenerate_low_quality=regenerate_low_quality,
                         )
                     )
                     answer = generate_qwen_answer(
@@ -1258,6 +1266,7 @@ def run_qwen(
                         },
                         "overall_question_quality": quality_scores["overall_question_quality"],
                         "quality_threshold": quality_threshold,
+                        "quality_gate_enabled": regenerate_low_quality,
                         "quality_threshold_met": (
                             quality_scores["overall_question_quality"] >= quality_threshold
                         ),
@@ -1324,6 +1333,7 @@ def run_qwen(
             "question_judge_repeats": question_judge_repeats,
             "quality_threshold": quality_threshold,
             "max_regenerations": max_regenerations,
+            "regenerate_low_quality": regenerate_low_quality,
             "candidate_model": candidate_model,
             "judge_model": judge_model,
             "judge_repeats": judge_repeats,
@@ -1371,6 +1381,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-judge-repeats", type=int, default=3)
     parser.add_argument("--quality-threshold", type=float, default=7.0)
     parser.add_argument("--max-regenerations", type=int, default=2)
+    parser.add_argument(
+        "--regenerate-low-quality",
+        action="store_true",
+        help=(
+            "Regenerate questions below --quality-threshold. Disabled by default, "
+            "so every generated question is retained for unbiased analysis."
+        ),
+    )
     parser.add_argument("--candidate-model", default="qwen-max")
     parser.add_argument("--judge-model", default="qwen-max")
     parser.add_argument("--qwen-candidates", type=int, default=30)
@@ -1422,8 +1440,11 @@ def main() -> None:
             raise SystemExit("--quality-threshold must be within [1,10]")
         if args.max_regenerations < 0:
             raise SystemExit("--max-regenerations must be non-negative")
+        question_attempts = (
+            args.max_regenerations + 1 if args.regenerate_low_quality else 1
+        )
         calls_per_turn = (
-            (args.max_regenerations + 1) * (1 + args.question_judge_repeats)
+            question_attempts * (1 + args.question_judge_repeats)
             + 1
             + args.judge_repeats
         )
@@ -1450,6 +1471,7 @@ def main() -> None:
             question_judge_repeats=args.question_judge_repeats,
             quality_threshold=args.quality_threshold,
             max_regenerations=args.max_regenerations,
+            regenerate_low_quality=args.regenerate_low_quality,
             judge_repeats=args.judge_repeats,
             seed=args.seed,
             request_delay=args.request_delay,
