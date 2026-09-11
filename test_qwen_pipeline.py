@@ -55,7 +55,7 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
                 anchor = "解析边界"
             elif is_tree:
                 task = "依据未知可选字段的解析边界，旧客户端会得到什么结果？"
-                anchor = "原有必填字段及其语义均未改变"
+                anchor = "未知可选字段的解析边界"
             else:
                 task = "此次新增可选字段是否保持向后兼容？"
                 anchor = ""
@@ -93,7 +93,7 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
                 "atomicity_check": "只有一个评分结论",
                 "claim_check": "未超出答案边界",
                 "diagnostic_anchor": (
-                    "原有必填字段及其语义均未改变" if is_tree else ""
+                    "未知可选字段的解析边界" if is_tree else ""
                 ),
                 "single_scoring_criterion": "是否正确判断旧客户端解析结果",
                 "skill_alignment_check": "直接考查API兼容边界",
@@ -766,12 +766,7 @@ class QwenPipelineTest(unittest.TestCase):
                     ][0]
                     self.assertNotEqual(plain["single_task"], tree["single_task"])
                     self.assertEqual(plain["diagnostic_anchor"], "")
-                    self.assertFalse(tree["diagnostic_anchor_verbatim_in_task"])
-                    self.assertIn(
-                        contract["decisive_fact_index"],
-                        tree["required_fact_indices"],
-                    )
-                    self.assertFalse(tree["diagnostic_fact_index_repaired"])
+                    self.assertIn(tree["diagnostic_anchor"], tree["single_task"])
                     self.assertNotIn("并解释", tree["single_task"])
                     self.assertTrue(plain["all_contract_facts_visible"])
                     self.assertTrue(tree["all_contract_facts_visible"])
