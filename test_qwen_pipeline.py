@@ -59,7 +59,7 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
             else:
                 task = "此次新增可选字段是否保持向后兼容？"
                 anchor = ""
-            content = json.dumps({
+            probe_output = {
                 "operation": "predict_outcome" if is_tree else "choose_under_constraint",
                 "single_task": task,
                 "answer_outline": "旧客户端忽略新增字段并继续解析原有字段",
@@ -72,7 +72,11 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
                 "single_scoring_criterion": "是否正确预测旧客户端解析结果",
                 "skill_alignment_check": "直接考查API兼容边界",
                 "visible_evidence_check": "答案事实均在题面中可见",
-            }, ensure_ascii=False)
+            }
+            content = (
+                repr(probe_output)
+                if is_tree else json.dumps(probe_output, ensure_ascii=False)
+            )
         elif "V2.6技术有效性编辑器" in system:
             validation_input = payload["messages"][1]["content"]
             is_tree = "探针类型：证据锚定" in validation_input

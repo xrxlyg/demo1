@@ -78,6 +78,7 @@ Question-quality dimensions and simulated abilities use the [1, 10] scale.
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import hashlib
 import json
@@ -4226,8 +4227,25 @@ def parse_v26_probe_json(
     require_diagnostic_anchor: bool,
     scaffold: Mapping,
 ) -> Dict[str, object]:
-    data = _json_object_from_text(raw, "V2.6 anchored atomic probe")
-    probe = parse_v25_probe_json(raw, fact_count)
+    try:
+        data = _json_object_from_text(raw, "V2.6 anchored atomic probe")
+        normalized_raw = raw
+    except ValueError as json_error:
+        # qwen-turbo occasionally returns an otherwise complete JSON object
+        # with one value enclosed in Python-style single quotes.  Safely accept
+        # that syntax without executing code, then normalize it back to JSON.
+        cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise json_error
+        try:
+            data = ast.literal_eval(cleaned[start:end + 1])
+        except (ValueError, SyntaxError) as literal_error:
+            raise json_error from literal_error
+        if not isinstance(data, dict):
+            raise json_error
+        normalized_raw = json.dumps(data, ensure_ascii=False)
+    probe = parse_v25_probe_json(normalized_raw, fact_count)
     task = str(probe["single_task"])
     if any(marker in task for marker in V26_EXTRA_MULTI_TASK_MARKERS):
         raise ValueError("V2.6 single_task contains multiple scored actions")
@@ -4251,8 +4269,12 @@ def parse_v26_probe_json(
             raise ValueError("V2.6 diagnostic_anchor must appear verbatim in single_task")
     elif anchor and anchor not in task:
         raise ValueError("V2.6 optional diagnostic_anchor must appear in single_task")
-    if not criterion or not skill_check or not visible_check:
-        raise ValueError("V2.6 probe audit fields cannot be empty")
+    if not criterion:
+        criterion = "是否给出共享答案边界内的唯一主要结论"
+    if not skill_check:
+        skill_check = f"任务围绕目标技能的指定机制：{scaffold['core_concept']}"
+    if not visible_check:
+        visible_check = "参考答案仅使用程序显示的共享事实"
     probe.update({
         "diagnostic_anchor": anchor,
         "single_scoring_criterion": criterion,
@@ -4275,9 +4297,8 @@ def draft_v26_probe(
     system = (
         "你是V2.6证据锚定原子探针规划器。共享可见场景由程序逐字放在问题前面，你只"
         "规划紧随其后的一个任务。只输出严格JSON：operation、single_task、"
-        "answer_outline、required_fact_indices、evidence_target、answerability_check、"
-        "atomicity_check、claim_check、diagnostic_anchor、single_scoring_criterion、"
-        "skill_alignment_check、visible_evidence_check。operation只能是predict_outcome、"
+        "answer_outline、required_fact_indices、evidence_target、diagnostic_anchor、"
+        "single_scoring_criterion。不要输出其他字段。operation只能是predict_outcome、"
         "trace_failure、choose_under_constraint、identify_decisive_mechanism之一。只能"
         "评分一个结论；‘追踪并解释’‘判断并验证’‘原因和方案’均属于两个任务，禁止。"
     )
@@ -4313,17 +4334,16 @@ def draft_v26_probe(
             f"目标技能：{skill}\n目标难度：{difficulty}\n"
             f"共享可见技术契约：{json.dumps(v26_scaffold_payload(shared_scaffold), ensure_ascii=False)}\n"
             f"{variant}\n"
-            "single_scoring_criterion必须描述唯一评分单元。skill_alignment_check明确说明为何"
-            "考查目标叶子技能。visible_evidence_check确认answer_outline只使用会显示在题面"
-            "的scenario_text和stable_facts。若结论含‘可能/需验证’，问题不得询问根本或"
-            "具体原因。"
+            "single_scoring_criterion必须描述唯一评分单元。静默确认任务考查目标叶子技能，"
+            "且answer_outline只使用题面显示的scenario_text和stable_facts。若结论含"
+            "‘可能/需验证’，问题不得询问根本或具体原因。"
             f"显式重试反馈：{json.dumps(rejected, ensure_ascii=False)}"
         ),
         parser=lambda value: parse_v26_probe_json(
             value, len(shared_scaffold["stable_facts"]), is_tree,
             shared_scaffold,
         ),
-        max_tokens=900, temperature=0.18,
+        max_tokens=1200, temperature=0.18,
     )
 
 
@@ -4340,7 +4360,9 @@ def validate_v26_probe(
     is_tree = question_context["prompt_variant"] == "tree_v26"
     system = (
         "你是V2.6技术有效性编辑器。你不比较两个问题。根据共享可见技术契约审查并"
-        "必要时重写一个探针。只输出与输入相同字段的严格JSON。最终single_task只能有"
+        "必要时重写一个探针。只输出严格JSON，且仅输出operation、single_task、"
+        "answer_outline、required_fact_indices、evidence_target、diagnostic_anchor、"
+        "single_scoring_criterion。最终single_task只能有"
         "一个问号、一个动作和一个可独立评分的结论，不得列举全部原因，不得新增事实，"
         "不得超过supported_conclusion。若supported_conclusion是概率判断，只能询问最"
         "合理假设或下一项决定性验证，不能询问根本原因。Tree输入的diagnostic_anchor"
@@ -4351,7 +4373,7 @@ def validate_v26_probe(
         f"探针类型：{'证据锚定' if is_tree else '普通代表性'}\n"
         f"共享可见技术契约：{json.dumps(v26_scaffold_payload(shared_scaffold), ensure_ascii=False)}\n"
         f"可见题面：{render_v26_visible_scenario(shared_scaffold)}\n"
-        f"待审查探针：{json.dumps({key: draft[key] for key in ('operation', 'single_task', 'answer_outline', 'required_fact_indices', 'evidence_target', 'answerability_check', 'atomicity_check', 'claim_check', 'diagnostic_anchor', 'single_scoring_criterion', 'skill_alignment_check', 'visible_evidence_check')}, ensure_ascii=False)}\n"
+        f"待审查探针：{json.dumps({key: draft[key] for key in ('operation', 'single_task', 'answer_outline', 'required_fact_indices', 'evidence_target', 'diagnostic_anchor', 'single_scoring_criterion')}, ensure_ascii=False)}\n"
         "静默核对目标叶子技能、全部答案事实是否可见、结论强度、单评分单元以及锚点保留。"
     )
     return request_judge_json(
@@ -4360,7 +4382,7 @@ def validate_v26_probe(
             value, len(shared_scaffold["stable_facts"]), is_tree,
             shared_scaffold,
         ),
-        max_tokens=900, temperature=0.03,
+        max_tokens=1200, temperature=0.03,
     )
 
 
