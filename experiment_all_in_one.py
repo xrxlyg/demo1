@@ -16,6 +16,8 @@ Included:
   6. V2 contrast-card prompting, budget-matched draft/revision, and blind A/B judging.
   7. V2.1 structured diagnostic blueprints, a shared technical-validity guard,
      and optional counterfactual H0/H1 discrimination evaluation.
+  8. V2.2 atomic diagnostic probes with answerability-first realization.  It
+     preserves V2.1 while reducing unsupported assumptions and multi-part tasks.
 
 Examples:
   python experiment_all_in_one.py --mode exp1 --output runs
@@ -29,6 +31,10 @@ Examples:
       --qwen-candidates 3 --qwen-questions 3 --pairwise-judge-repeats 3 \
       --diagnostic-discrimination-repeats 1 \
       --confirm-api-calls --output runs_v21
+  python experiment_all_in_one.py --mode prompt_ablation_v22 \
+      --qwen-candidates 3 --qwen-questions 3 --pairwise-judge-repeats 3 \
+      --diagnostic-discrimination-repeats 1 \
+      --confirm-api-calls --output runs_v22
   python experiment_all_in_one.py --mode all  --seeds 20 --output runs
   python experiment_all_in_one.py --mode analyze --output runs
 
@@ -2806,6 +2812,273 @@ def generate_blueprint_question(
     )
 
 
+# V2.2 is deliberately a new mode rather than an in-place V2.1 rewrite.  The
+# ablation remains budget matched (one blueprint call and one realization call
+# per variant), while the blueprint is narrowed to a single, answerable probe.
+V22_BLUEPRINT_FIELDS = (
+    "core_concept",
+    "stable_facts",
+    "expected_answer_points",
+    "single_decision",
+    "correct_answer_outline",
+    "assumptions_to_avoid",
+    "diagnostic_probe",
+    "history_link",
+)
+
+V22_SHARED_VALIDITY_GUARD = (
+    "技术正确性、条件充分性和单任务结构是硬约束。题目只能依赖题面明确给出的事实与"
+    "稳定的标准概念；若答案取决于版本、配置、运行环境或业务目标，必须在题面明确"
+    "给出相应条件。只考查一个核心概念，只要求一次判断、推演或选择及其一个核心"
+    "理由，不得同时要求设计、实现、监控、排障等多个任务。预期答案必须能由题面"
+    "推出；若诊断性与正确性、清晰度冲突，必须简化诊断目标。"
+)
+
+
+def parse_v22_question_blueprint_json(raw: str) -> Dict[str, object]:
+    data = _json_object_from_text(raw, "V2.2 question blueprint")
+    parsed: Dict[str, object] = {}
+    list_fields = {
+        "stable_facts", "expected_answer_points", "assumptions_to_avoid",
+    }
+    for field in V22_BLUEPRINT_FIELDS:
+        value = data[field]
+        if field in list_fields:
+            if not isinstance(value, list) or not value:
+                raise ValueError(f"V2.2 blueprint field {field} must be a non-empty list")
+            items = [str(item).strip()[:260] for item in value if str(item).strip()]
+            if not items:
+                raise ValueError(f"V2.2 blueprint field {field} contains no usable items")
+            parsed[field] = items[:4]
+        else:
+            text_value = str(value).strip()
+            if not text_value:
+                raise ValueError(f"V2.2 blueprint field {field} cannot be empty")
+            parsed[field] = text_value[:600]
+    return parsed
+
+
+def v22_blueprint_prompt_payload(blueprint: Mapping) -> Dict[str, object]:
+    return {field: blueprint[field] for field in V22_BLUEPRINT_FIELDS}
+
+
+def build_v22_question_blueprint(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    rejected_attempts: Sequence[Mapping],
+    question_context: Mapping,
+) -> Dict[str, object]:
+    """Plan one minimal, technically checkable probe without using the judge."""
+    system = (
+        "你是严谨的技术面试问题规划器。先规划，不要直接写最终问题。只输出严格JSON"
+        "对象，不得输出Markdown。JSON必须包含core_concept字符串、stable_facts字符串"
+        "数组、expected_answer_points字符串数组、single_decision字符串、"
+        "correct_answer_outline字符串、assumptions_to_avoid字符串数组、"
+        "diagnostic_probe字符串和history_link字符串。"
+        + V22_SHARED_VALIDITY_GUARD
+    )
+    previous_questions = [
+        str(row.get("question", ""))[:300] for row in dialogue_history[-6:]
+    ]
+    recent_dialogue = [
+        {
+            "skill": row.get("skill"),
+            "question": str(row.get("question", ""))[:320],
+            "answer": str(row.get("answer", ""))[:420],
+        }
+        for row in dialogue_history[-2:]
+    ]
+    difficulty_guidance = {
+        "easy": "一个稳定核心概念或常见边界，不使用复杂生产假设",
+        "medium": "一个明确工程场景中的机制判断或主要权衡",
+        "hard": "一个明确故障或边界条件下的单一推演，不扩展为系统设计题",
+    }[difficulty]
+    common = (
+        f"目标能力路径：{' → '.join(question_context['capability_path'])}\n"
+        f"目标技能：{skill}\n目标难度：{difficulty}（{difficulty_guidance}）\n"
+        f"最近对话：{json.dumps(recent_dialogue, ensure_ascii=False)}\n"
+        f"已有问题（不得重复同一核心机制）："
+        f"{json.dumps(previous_questions, ensure_ascii=False)}\n"
+        f"共同硬约束：{V22_SHARED_VALIDITY_GUARD}\n"
+        "stable_facts限制为1到3项最小充分事实；expected_answer_points限制为1到2项；"
+        "single_decision只能包含一个动词任务；correct_answer_outline必须证明该任务可由"
+        "题面事实回答；assumptions_to_avoid列出不得擅自补充的环境或实现假设。\n"
+    )
+    if question_context["prompt_variant"] == "tree_v22":
+        card = question_context["diagnostic_contrast_card"]
+        variant_instruction = (
+            "这是能力树自适应规划。H0/H1仅用于选择一个最小诊断探针，不得增加题面"
+            "复杂度。diagnostic_probe只能区分一个原子差异，例如一个常见误解、一次"
+            "结果预测、一个边界判断或一个主要权衡；两个状态都必须能够合理回答同一"
+            "问题，不得把H1结论预设为题面事实。history_link仅在最近回答包含可直接"
+            "引用的明确证据缺口时填写，否则写‘无’。最终问题不得出现任何策略信息。\n"
+            f"H0：{card['lower_hypothesis']}\n"
+            f"H1：{card['upper_hypothesis']}\n"
+            f"候选区分证据：{card['required_discriminating_evidence']}\n"
+            f"可能的历史缺口：{card['previous_answer_gap']}"
+        )
+    else:
+        variant_instruction = (
+            "这是普通固定目标规划，不提供能力假设。选择一个典型且最小的技术能力"
+            "探针；diagnostic_probe填写优秀回答应展示的一项可观察证据。不要为了显得"
+            "复杂而引入额外组件、故障或限制。history_link仅在最近回答确有明确关联时"
+            "填写，否则写‘无’。"
+        )
+    rejected = [
+        {
+            "question": str(row.get("question", ""))[:320],
+            "feedback": str(row.get("feedback", ""))[:420],
+        }
+        for row in rejected_attempts[-2:]
+    ]
+    return request_judge_json(
+        client=client,
+        model=model,
+        system=system,
+        user=(
+            common + variant_instruction
+            + f"\n显式低分重试历史：{json.dumps(rejected, ensure_ascii=False)}"
+        ),
+        parser=parse_v22_question_blueprint_json,
+        max_tokens=750,
+        temperature=0.30,
+    )
+
+
+def generate_v22_question_from_blueprint(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    question_context: Mapping,
+    blueprint: Mapping,
+) -> str:
+    """Realize an atomic probe after an answerability-first silent check."""
+    system = (
+        "你是严谨的技术面试问题生成器。只输出一个最终中文面试问题，不要输出答案、"
+        "解释、标题、评分、JSON或Markdown。最多两句话，只有一个问号和一个主要任务。"
+        + V22_SHARED_VALIDITY_GUARD
+        + "输出前先静默完成三步检查：第一，根据stable_facts独立推导正确答案；第二，"
+        "删除无法由题面支持的前提、版本默认值和多余任务；第三，确认术语、条件、"
+        "预期答案和难度一致。若蓝图过于复杂或存在不确定事实，改写为更保守的标准"
+        "机制问题，不得照搬风险内容。"
+    )
+    recent_dialogue = [
+        {
+            "question": str(row.get("question", ""))[:320],
+            "answer": str(row.get("answer", ""))[:420],
+        }
+        for row in dialogue_history[-2:]
+    ]
+    if question_context["prompt_variant"] == "tree_v22":
+        variant_instruction = (
+            "仅在技术上安全时使用diagnostic_probe，使不同水平的回答自然呈现差异；"
+            "不要把诊断假设、能力状态或区分目标写进题面，也不要因此添加第二个任务。"
+        )
+    else:
+        variant_instruction = (
+            "根据同一蓝图结构生成自然、典型、符合难度的普通技术面试问题。"
+        )
+    user = (
+        f"目标能力路径：{' → '.join(question_context['capability_path'])}\n"
+        f"目标技能：{skill}\n目标难度：{difficulty}\n"
+        f"问题蓝图：{json.dumps(v22_blueprint_prompt_payload(blueprint), ensure_ascii=False)}\n"
+        f"最近对话：{json.dumps(recent_dialogue, ensure_ascii=False)}\n"
+        f"硬约束：{V22_SHARED_VALIDITY_GUARD}\n"
+        f"{variant_instruction}\n只输出最终问题。"
+    )
+    return client.chat(model, system, user, temperature=0.30, max_tokens=300).strip()
+
+
+def generate_v22_blueprint_question(
+    client: QwenClient,
+    question_model: str,
+    question_judge_model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+    regenerate_low_quality: bool,
+    question_context: Mapping,
+) -> Tuple[str, Dict[str, float], int, List[Dict]]:
+    """V2.2 blueprint -> atomic question -> independent blind evaluation."""
+    attempts = []
+    rejected = []
+    maximum_attempts = max_regenerations + 1 if regenerate_low_quality else 1
+    for attempt_index in range(maximum_attempts):
+        blueprint = build_v22_question_blueprint(
+            client, question_model, skill, difficulty, dialogue_history,
+            rejected, question_context,
+        )
+        question = generate_v22_question_from_blueprint(
+            client, question_model, skill, difficulty, dialogue_history,
+            question_context, blueprint,
+        )
+        quality_scores, judge_details = evaluate_qwen_question(
+            client, question_judge_model, skill, difficulty, question,
+            dialogue_history, judge_repeats, question_context,
+        )
+        passes_quality = (
+            quality_scores["overall_question_quality"] >= quality_threshold
+            and quality_scores["technical_correctness"] >= 7.0
+            and quality_scores["general_question_quality"] >= 7.0
+        )
+        attempts.append({
+            "attempt": attempt_index,
+            "question_blueprint": v22_blueprint_prompt_payload(blueprint),
+            "blueprint_model_raw_output": blueprint.get("raw", ""),
+            "blueprint_format_retry_count": blueprint.get("format_retry_count", 0),
+            "blueprint_invalid_raw_outputs": blueprint.get("invalid_raw_outputs", []),
+            "question": question,
+            "question_model_raw_output": question,
+            "quality_scores": quality_scores,
+            "question_judge_details": judge_details,
+            "generation_pipeline": "atomic_blueprint_then_answerability_guarded_question",
+            "technical_validity_guard": True,
+            "strategy_leakage_flags": v21_question_leakage_flags(question),
+            "explicit_retry_gate_passed": passes_quality,
+        })
+        if not regenerate_low_quality or passes_quality:
+            break
+        failed_metrics = [
+            name for name, passed in (
+                (
+                    "overall_question_quality",
+                    quality_scores["overall_question_quality"] >= quality_threshold,
+                ),
+                (
+                    "technical_correctness",
+                    quality_scores["technical_correctness"] >= 7.0,
+                ),
+                (
+                    "general_question_quality",
+                    quality_scores["general_question_quality"] >= 7.0,
+                ),
+            )
+            if not passed
+        ]
+        rejected.append({
+            "question": question,
+            "feedback": (
+                f"未通过显式重试门槛：{', '.join(failed_metrics)}；"
+                + "; ".join(
+                    row["reason"] for row in judge_details if row["reason"]
+                )
+            )[:1000],
+        })
+    accepted = attempts[-1]
+    return (
+        accepted["question"], accepted["quality_scores"],
+        len(attempts) - 1, attempts,
+    )
+
+
 def parse_counterfactual_answers_json(raw: str) -> Dict[str, str]:
     data = _json_object_from_text(raw, "Counterfactual answer")
     lower = str(data["lower_answer"]).strip()
@@ -3396,7 +3669,9 @@ def run_qwen(
         )
     write_csv(output_dir / "candidate_results.csv", candidate_rows)
     atomic_json(output_dir / "summary.json", result)
-    run_question_quality_analysis(turns_path, output_dir / "quality_analysis")
+    run_question_quality_analysis(
+        turns_path, output_dir / "quality_analysis", print_summary=False,
+    )
     return result
 
 
@@ -3641,7 +3916,9 @@ def run_prompt_ablation(
         ),
     }
     atomic_json(output_dir / "summary.json", summary)
-    run_question_quality_analysis(turns_path, output_dir / "quality_analysis")
+    run_question_quality_analysis(
+        turns_path, output_dir / "quality_analysis", print_summary=False,
+    )
     return summary
 
 
@@ -4193,7 +4470,9 @@ def run_prompt_ablation_v2(
         "blind_pairwise_preference": summarize_pairwise_preferences(pairs),
     }
     atomic_json(output_dir / "summary.json", result)
-    run_question_quality_analysis(turns_path, output_dir / "quality_analysis")
+    run_question_quality_analysis(
+        turns_path, output_dir / "quality_analysis", print_summary=False,
+    )
     return result
 
 
@@ -4511,7 +4790,313 @@ def run_prompt_ablation_v21(
         output_dir / "counterfactual_discrimination_pairs.csv",
         flatten_counterfactual_pairs(pairs),
     )
-    run_question_quality_analysis(turns_path, output_dir / "quality_analysis")
+    run_question_quality_analysis(
+        turns_path, output_dir / "quality_analysis", print_summary=False,
+    )
+    atomic_json(output_dir / "key_metrics.json", prompt_key_metrics(result))
+    return result
+
+
+def run_prompt_ablation_v22(
+    output_root: Path,
+    api_key: str,
+    base_url: str,
+    question_model: str,
+    question_judge_model: str,
+    candidate_model: str,
+    n_candidates: int,
+    questions: int,
+    question_judge_repeats: int,
+    pairwise_judge_repeats: int,
+    diagnostic_discrimination_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+    regenerate_low_quality: bool,
+    seed: int,
+    request_delay: float,
+) -> Dict:
+    """V2.2 fixed-target ablation with minimal answerable diagnostic probes."""
+    output_dir = output_root / "exp7_prompt_ablation_v22"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    profiles_path = output_dir / "profiles.json"
+    pairs_path = output_dir / "pairs.jsonl"
+    turns_path = output_dir / "turns.jsonl"
+    setup_path = output_dir / "setup.json"
+    profiles = generate_profiles(n_candidates, seed)
+    plain_variant = "prompt_plain_v22"
+    tree_variant = "prompt_tree_v22"
+    variants = (plain_variant, tree_variant)
+    setup = {
+        "schema_version": 3,
+        "method_version": "V2.2",
+        "seed": seed,
+        "question_model": question_model,
+        "question_judge_model": question_judge_model,
+        "candidate_model": candidate_model,
+        "question_judge_repeats": question_judge_repeats,
+        "pairwise_judge_repeats": pairwise_judge_repeats,
+        "diagnostic_discrimination_repeats": diagnostic_discrimination_repeats,
+        "quality_threshold": quality_threshold,
+        "max_regenerations": max_regenerations,
+        "regenerate_low_quality": regenerate_low_quality,
+        "ability_update_source": "deterministic_latent_simulation",
+        "candidates": n_candidates,
+        "questions": questions,
+        "prompt_variants": list(variants),
+        "generation_pipeline": (
+            "qwen-turbo atomic blueprint then qwen-turbo answerability-first "
+            "technical-validity-guarded realization"
+        ),
+        "shared_validity_guard": V22_SHARED_VALIDITY_GUARD,
+        "target_sampling": (
+            "diagnostic uncertainty frontier; identical path, target, difficulty, "
+            "posterior state, candidate state, and history for both variants"
+        ),
+        "pairwise_order": "blind deterministic randomization per repeat",
+        "primary_metric": "blind_pairwise_adaptive_preference",
+        "key_secondary_metric": "adaptive_diagnostic_quality",
+        "mechanism_metric": "counterfactual_h0_h1_discrimination",
+        "general_quality_role": "non-inferiority safeguard; margin -0.10",
+        "technical_correctness_role": "validity safeguard; target delta >= -0.05",
+        "v21_preserved": True,
+        "v22_change": (
+            "one atomic probe, 1-3 stable facts, 1-2 answer points, explicit "
+            "answerability outline, forbidden assumptions, and lower temperature"
+        ),
+    }
+    if setup_path.exists():
+        saved_setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        if saved_setup != setup:
+            raise ValueError(
+                "Existing V2.2 setup does not match this run; use the original "
+                "arguments or a different --output directory"
+            )
+    else:
+        atomic_json(setup_path, setup)
+    serialized_profiles = [asdict(profile) for profile in profiles]
+    if profiles_path.exists():
+        if json.loads(profiles_path.read_text(encoding="utf-8")) != serialized_profiles:
+            raise ValueError("Existing V2.2 profiles do not match the requested seed/setup")
+    else:
+        atomic_json(profiles_path, serialized_profiles)
+
+    existing = load_jsonl(pairs_path)
+    grouped: Dict[object, List[Dict]] = defaultdict(list)
+    seen = set()
+    for pair in existing:
+        key = (pair["candidate_id"], pair["turn"])
+        if key in seen:
+            raise ValueError(f"Duplicate V2.2 pair record: {key}")
+        seen.add(key)
+        if set(pair["variants"]) != set(variants):
+            raise ValueError(f"Incomplete V2.2 pair record: {key}")
+        grouped[pair["candidate_id"]].append(pair)
+    for candidate_id, candidate_pairs in grouped.items():
+        candidate_pairs.sort(key=lambda row: int(row["turn"]))
+        turns = [int(row["turn"]) for row in candidate_pairs]
+        if turns != list(range(len(turns))) or len(turns) > questions:
+            raise ValueError(f"Non-contiguous V2.2 pairs for candidate {candidate_id}")
+
+    client = QwenClient(api_key, base_url)
+    total = n_candidates * questions
+    with tqdm(
+        total=total,
+        initial=len(existing),
+        desc="V2.2 answerability-first prompt pairs",
+    ) as progress:
+        for profile in profiles:
+            model = BayesianAbilityModel(propagation="tree")
+            per_skill_count: Dict[str, int] = defaultdict(int)
+            history = []
+            completed = grouped[profile.candidate_id]
+            for pair in completed:
+                model.update(
+                    pair["skill"], pair["ability_observation_score"],
+                    observation_std=pair["ability_observation_std"],
+                )
+                per_skill_count[pair["skill"]] += 1
+                history.append({
+                    "turn": pair["turn"],
+                    "skill": pair["skill"],
+                    "question": pair["canonical_question"],
+                    "answer": pair["answer"],
+                    "ability_observation_score": pair["ability_observation_score"],
+                    "ability_observation_std": pair["ability_observation_std"],
+                })
+
+            for turn in range(len(completed), questions):
+                recent = [row["skill"] for row in history[-6:]]
+                skill, difficulty, components = select_diagnostic_challenge_skill(
+                    model, recent,
+                )
+                base_context = build_question_context(
+                    "bridge", model, skill, components, history,
+                )
+                contrast_card = build_diagnostic_contrast_card(model, skill, history)
+                base_context["diagnostic_contrast_card"] = contrast_card
+                history_hash = hashlib.sha256(
+                    json.dumps(history, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                pair_id = f"v22-c{profile.candidate_id:03d}-t{turn:03d}"
+                generated: Dict[str, Dict] = {}
+                generation_order = list(variants)
+                if stable_seed("v22-generation-order", pair_id) % 2:
+                    generation_order.reverse()
+                for variant in generation_order:
+                    context = dict(base_context)
+                    context["prompt_variant"] = (
+                        "tree_v22" if variant == tree_variant else "plain_v22"
+                    )
+                    question, scores, regeneration_count, attempts = (
+                        generate_v22_blueprint_question(
+                            client, question_model, question_judge_model,
+                            skill, difficulty, history, question_judge_repeats,
+                            quality_threshold, max_regenerations,
+                            regenerate_low_quality, context,
+                        )
+                    )
+                    discrimination = evaluate_counterfactual_discrimination(
+                        client=client,
+                        answer_model=candidate_model,
+                        judge_model=question_judge_model,
+                        skill=skill,
+                        difficulty=difficulty,
+                        question=question,
+                        contrast_card=contrast_card,
+                        repeats=diagnostic_discrimination_repeats,
+                        pair_id=pair_id,
+                        variant=variant,
+                    )
+                    generated[variant] = {
+                        "question": question,
+                        "quality_scores": scores,
+                        "regeneration_count": regeneration_count,
+                        "question_generation_attempts": attempts,
+                        "question_context": context,
+                        "counterfactual_discrimination": discrimination,
+                    }
+
+                pairwise = evaluate_question_pair(
+                    client, question_judge_model, skill, difficulty,
+                    generated[tree_variant]["question"],
+                    generated[plain_variant]["question"],
+                    history, base_context, pairwise_judge_repeats, pair_id,
+                    tree_variant=tree_variant, plain_variant=plain_variant,
+                )
+                canonical_question = generated[tree_variant]["question"]
+                answer = generate_qwen_answer(
+                    client, candidate_model, profile, skill, canonical_question,
+                )
+                job_before = model.job_variance()
+                total_before = model.total_variance()
+                hierarchy_before = model.hierarchy_variance(skill)
+                ability_score, ability_std = simulate_score(
+                    profile, skill, difficulty, per_skill_count[skill], seed,
+                )
+                model.update(skill, ability_score, observation_std=ability_std)
+                per_skill_count[skill] += 1
+                pair = {
+                    "created_at": utc_now(),
+                    "method_version": "V2.2",
+                    "candidate_id": profile.candidate_id,
+                    "level": profile.level,
+                    "turn": turn,
+                    "pair_id": pair_id,
+                    "history_snapshot_sha256": history_hash,
+                    "generation_order": generation_order,
+                    "skill": skill,
+                    "cluster": SKILL_TO_CLUSTER[skill],
+                    "branch": SKILL_TO_BRANCH[skill],
+                    "capability_path": list(SKILL_PATHS[skill]),
+                    "difficulty": difficulty,
+                    "quality_threshold": quality_threshold,
+                    "quality_gate_enabled": regenerate_low_quality,
+                    "variants": generated,
+                    "pairwise_evaluation": pairwise,
+                    "canonical_question": canonical_question,
+                    "answer": answer,
+                    "assigned_skill_theta": profile.skill_theta[skill],
+                    "ability_observation_score": ability_score,
+                    "ability_observation_std": ability_std,
+                    "posterior_skill_mean": model.skill_mean(skill),
+                    "posterior_skill_std": math.sqrt(model.skill_variance(skill)),
+                    "posterior_job_mean": model.job_mean(),
+                    "posterior_job_std": math.sqrt(model.job_variance()),
+                    "realized_job_variance_reduction": job_before - model.job_variance(),
+                    "realized_global_variance_reduction": total_before - model.total_variance(),
+                    "realized_hierarchy_variance_reduction": (
+                        hierarchy_before - model.hierarchy_variance(skill)
+                    ),
+                    "selector": components,
+                }
+                append_jsonl(pairs_path, pair)
+                grouped[profile.candidate_id].append(pair)
+                history.append({
+                    "turn": turn,
+                    "skill": skill,
+                    "question": canonical_question,
+                    "answer": answer,
+                    "ability_observation_score": ability_score,
+                    "ability_observation_std": ability_std,
+                })
+                progress.update(1)
+                time.sleep(max(request_delay, 0.0))
+
+    pairs = load_jsonl(pairs_path)
+    rows = flatten_v2_prompt_pairs(pairs)
+    write_jsonl_atomic(turns_path, rows)
+    discrimination = summarize_counterfactual_discrimination(
+        pairs, tree_variant, plain_variant,
+    )
+    result = {
+        "warning": (
+            "Candidates and H0/H1 answers are controlled Qwen simulations, not "
+            "humans. All generated questions are retained by default."
+        ),
+        "setup": setup,
+        "summary": {
+            variant: summarize_question_records([
+                row for row in rows if row["strategy"] == variant
+            ])
+            for variant in variants
+        },
+        "paired_absolute_quality": paired_question_quality_comparison(
+            rows, tree_variant, plain_variant,
+        ),
+        "blind_pairwise_preference": summarize_pairwise_preferences(
+            pairs, tree_variant, plain_variant,
+        ),
+        "counterfactual_discrimination": discrimination,
+        "judge_reliability": compact_judge_reliability(rows, variants),
+        "validity_audit": {
+            variant: {
+                "strategy_leakage_rate": quality_mean([
+                    float(bool(row.get("strategy_leakage_flags")))
+                    for row in rows if row["strategy"] == variant
+                ]),
+                "technical_correctness_below_7_rate": quality_mean([
+                    float(row["question_quality_scores"]["technical_correctness"] < 7.0)
+                    for row in rows if row["strategy"] == variant
+                ]),
+                "general_quality_below_7_rate": quality_mean([
+                    float(row["general_question_quality"] < 7.0)
+                    for row in rows if row["strategy"] == variant
+                ]),
+                "quality_gate_enabled": regenerate_low_quality,
+            }
+            for variant in variants
+        },
+    }
+    atomic_json(output_dir / "summary.json", result)
+    atomic_json(output_dir / "counterfactual_discrimination_summary.json", discrimination)
+    write_quality_csv(
+        output_dir / "counterfactual_discrimination_pairs.csv",
+        flatten_counterfactual_pairs(pairs),
+    )
+    run_question_quality_analysis(
+        turns_path, output_dir / "quality_analysis", print_summary=False,
+    )
+    atomic_json(output_dir / "key_metrics.json", prompt_key_metrics(result))
     return result
 
 
@@ -4869,6 +5454,7 @@ def paired_question_quality_comparison(
                 ("prompt_tree", "prompt_plain"),
                 ("prompt_tree_v2", "prompt_plain_v2"),
                 ("prompt_tree_v21", "prompt_plain_v21"),
+                ("prompt_tree_v22", "prompt_plain_v22"),
             )
             else "Strategies select different skills and difficulties, so this paired "
                  "delta measures end-to-end sequence quality rather than generator "
@@ -4914,7 +5500,11 @@ def write_quality_csv(path: Path, rows: Sequence[Mapping]) -> None:
         writer.writerows(rows)
 
 
-def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
+def run_question_quality_analysis(
+    input_path: Path,
+    output_dir: Path,
+    print_summary: bool = True,
+) -> Dict:
     rows = load_question_quality_jsonl(input_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     by_strategy = grouped_quality_summaries(rows, ["strategy"])
@@ -4933,6 +5523,7 @@ def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
             ("prompt_tree", "prompt_plain"),
             ("prompt_tree_v2", "prompt_plain_v2"),
             ("prompt_tree_v21", "prompt_plain_v21"),
+            ("prompt_tree_v22", "prompt_plain_v22"),
         )
         if set(pair).issubset(available_strategies)
     ]
@@ -4984,18 +5575,47 @@ def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
         output_dir / "question_quality_turns.csv",
         [flatten_quality_turn(row) for row in rows],
     )
-    print("\nQuestion quality by strategy")
-    for row in by_strategy:
-        print(
-            f"{row['strategy']}: n={row['n_turns']}, "
-            f"overall={row['overall_question_quality_mean']:.4f}, "
-            f"general={row['general_question_quality_mean']:.4f}, "
-            f"adaptive={row['adaptive_diagnostic_quality_mean']:.4f}, "
-            f"below_threshold={row['below_threshold_rate']:.4f}"
-        )
-    print("\nPaired comparison")
-    print(json.dumps(comparison, ensure_ascii=False, indent=2))
-    print(f"\nSaved analysis to: {output_dir.resolve()}")
+    if comparison.get("available"):
+        key_quality = {
+            "comparison": comparison["comparison"],
+            "n_paired_candidates": comparison["n_paired_candidates"],
+            "metrics": {
+                metric: comparison["metrics"][metric]
+                for metric in (
+                    "adaptive_diagnostic_quality", "technical_correctness",
+                    "general_question_quality", "overall_question_quality",
+                )
+            },
+            "general_quality_safeguard": comparison["general_quality_safeguard"],
+            "technical_correctness_safeguard": comparison[
+                "technical_correctness_safeguard"
+            ],
+        }
+    else:
+        key_quality = comparison
+    atomic_json(output_dir / "key_quality_metrics.json", key_quality)
+    if print_summary:
+        print("\nQuestion quality by strategy")
+        for row in by_strategy:
+            print(
+                f"{row['strategy']}: n={row['n_turns']}, "
+                f"overall={row['overall_question_quality_mean']:.3f}, "
+                f"general={row['general_question_quality_mean']:.3f}, "
+                f"adaptive={row['adaptive_diagnostic_quality_mean']:.3f}"
+            )
+        if comparison.get("available"):
+            print("\nKey paired deltas (first - second)")
+            for metric in (
+                "adaptive_diagnostic_quality", "technical_correctness",
+                "general_question_quality", "overall_question_quality",
+            ):
+                values = comparison["metrics"][metric]
+                print(
+                    f"{metric}: {values['mean_delta']:+.3f} "
+                    f"[{values['bootstrap_95_ci_low']:+.3f}, "
+                    f"{values['bootstrap_95_ci_high']:+.3f}]"
+                )
+        print(f"\nSaved analysis to: {output_dir.resolve()}")
     return report
 
 
@@ -5003,7 +5623,194 @@ def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
 # CLI
 # =============================================================================
 
-def print_compact(title: str, result: Dict) -> None:
+def prompt_key_metrics(result: Mapping) -> Dict[str, object]:
+    """Return the pre-registered prompt metrics without dropping full artifacts."""
+    comparison = result.get("paired_absolute_quality", {})
+    if not comparison.get("available"):
+        comparison = result.get("paired_prompt_comparison", {})
+    if not comparison.get("available"):
+        return {"available": False, "reason": "No paired prompt comparison"}
+
+    setup = result.get("setup", {})
+    variants = list(setup.get("prompt_variants", []))
+    tree_variant = next((name for name in variants if "tree" in name), "tree")
+    plain_variant = next((name for name in variants if "plain" in name), "plain")
+    metrics = comparison["metrics"]
+    adaptive = metrics["adaptive_diagnostic_quality"]
+    technical = metrics["technical_correctness"]
+    general = metrics["general_question_quality"]
+    overall = metrics["overall_question_quality"]
+    pairwise = result.get("blind_pairwise_preference", {})
+    discrimination = result.get("counterfactual_discrimination", {})
+    reliability = result.get("judge_reliability", {}).get(tree_variant, {})
+    audit = result.get("validity_audit", {}).get(tree_variant, {})
+
+    def delta(values: Mapping) -> Dict[str, float]:
+        return {
+            "tree_minus_plain": float(values["mean_delta"]),
+            "bootstrap_95_ci_low": float(values["bootstrap_95_ci_low"]),
+            "bootstrap_95_ci_high": float(values["bootstrap_95_ci_high"]),
+        }
+
+    key: Dict[str, object] = {
+        "available": True,
+        "method_version": setup.get("method_version", "legacy"),
+        "sample": {
+            "candidates": int(setup.get("candidates", comparison["n_paired_candidates"])),
+            "questions_per_candidate": int(setup.get("questions", 0)),
+            "paired_candidates": int(comparison["n_paired_candidates"]),
+            "question_pairs": int(pairwise.get("n_pairs", 0)),
+        },
+        "primary_blind_tree_preference": {
+            "value": float(pairwise.get("tree_preference_score", float("nan"))),
+            "bootstrap_95_ci_low": float(
+                pairwise.get("tree_preference_bootstrap_95_ci_low", float("nan"))
+            ),
+            "bootstrap_95_ci_high": float(
+                pairwise.get("tree_preference_bootstrap_95_ci_high", float("nan"))
+            ),
+            "development_target": 0.70,
+            "meets_point_target": (
+                float(pairwise.get("tree_preference_score", float("nan"))) >= 0.70
+            ),
+        },
+        "adaptive_diagnostic_quality": {
+            **delta(adaptive),
+            "development_target": 0.15,
+            "meets_point_target": float(adaptive["mean_delta"]) >= 0.15,
+        },
+        "technical_correctness": {
+            **delta(technical),
+            "development_target": -0.05,
+            "meets_point_target": float(technical["mean_delta"]) >= -0.05,
+        },
+        "general_question_quality": {
+            **delta(general),
+            "noninferiority_margin": -0.10,
+            "ci_above_margin": float(general["bootstrap_95_ci_low"]) > -0.10,
+        },
+        "overall_question_quality": delta(overall),
+        "tree_validity_audit": {
+            "strategy_leakage_rate": audit.get("strategy_leakage_rate"),
+            "technical_correctness_below_7_rate": audit.get(
+                "technical_correctness_below_7_rate"
+            ),
+            "general_quality_below_7_rate": audit.get(
+                "general_quality_below_7_rate"
+            ),
+        },
+        "tree_judge_reliability": {
+            "adaptive_diagnostic_quality_icc_1_k": reliability.get(
+                "adaptive_diagnostic_quality_judge_icc_1_k"
+            ),
+            "overall_question_quality_icc_1_k": reliability.get(
+                "overall_question_quality_judge_icc_1_k"
+            ),
+        },
+        "study_stage": (
+            "development only; after prompt changes use a new seed and new sample "
+            "for confirmation"
+        ),
+    }
+    if discrimination.get("available"):
+        by_variant = discrimination["by_variant"]
+        paired = discrimination["paired_tree_minus_plain"]
+        state = paired["state_classification_accuracy"]
+        diagnosticity = paired["mean_question_diagnosticity"]
+        key["counterfactual_h0_h1"] = {
+            "tree_state_accuracy": float(
+                by_variant[tree_variant]["state_classification_accuracy_mean"]
+            ),
+            "plain_state_accuracy": float(
+                by_variant[plain_variant]["state_classification_accuracy_mean"]
+            ),
+            "state_accuracy_delta": float(state["mean_delta"]),
+            "diagnosticity_delta": float(diagnosticity["mean_delta"]),
+            "note": "controlled simulation mechanism check, not human validation",
+        }
+    return key
+
+
+def _format_ci(values: Mapping, percent: bool = False) -> str:
+    scale = 100.0 if percent else 1.0
+    suffix = "%" if percent else ""
+    return (
+        f"[{float(values['bootstrap_95_ci_low']) * scale:+.2f}, "
+        f"{float(values['bootstrap_95_ci_high']) * scale:+.2f}]{suffix}"
+    )
+
+
+def print_prompt_key_metrics(title: str, result: Mapping) -> None:
+    key = prompt_key_metrics(result)
+    print(f"\n{title}")
+    if not key.get("available"):
+        print(key.get("reason", "No key metrics available"))
+        return
+    sample = key["sample"]
+    print(
+        f"Sample: {sample['paired_candidates']} candidates, "
+        f"{sample['question_pairs']} matched question pairs"
+    )
+    primary = key["primary_blind_tree_preference"]
+    print(
+        "Blind Tree preference: "
+        f"{primary['value'] * 100:.2f}% {_format_ci(primary, percent=True)} "
+        f"target>=70% [{'PASS' if primary['meets_point_target'] else 'FAIL'}]"
+    )
+    for label, key_name, target_text, pass_name in (
+        (
+            "Adaptive diagnostic quality", "adaptive_diagnostic_quality",
+            "target>=+0.15", "meets_point_target",
+        ),
+        (
+            "Technical correctness", "technical_correctness",
+            "target>=-0.05", "meets_point_target",
+        ),
+        (
+            "General question quality", "general_question_quality",
+            "CI lower>-0.10", "ci_above_margin",
+        ),
+    ):
+        values = key[key_name]
+        print(
+            f"{label}: {values['tree_minus_plain']:+.3f} {_format_ci(values)} "
+            f"{target_text} [{'PASS' if values[pass_name] else 'FAIL'}]"
+        )
+    overall = key["overall_question_quality"]
+    print(
+        f"Overall quality: {overall['tree_minus_plain']:+.3f} "
+        f"{_format_ci(overall)}"
+    )
+    mechanism = key.get("counterfactual_h0_h1")
+    if mechanism:
+        print(
+            "H0/H1 state accuracy: "
+            f"Tree={mechanism['tree_state_accuracy'] * 100:.2f}%, "
+            f"Plain={mechanism['plain_state_accuracy'] * 100:.2f}%, "
+            f"delta={mechanism['state_accuracy_delta'] * 100:+.2f} pp"
+        )
+        print(
+            "Counterfactual diagnosticity delta: "
+            f"{mechanism['diagnosticity_delta']:+.3f}"
+        )
+    audit = key["tree_validity_audit"]
+    if audit["strategy_leakage_rate"] is not None:
+        print(
+            "Tree validity: "
+            f"leakage={audit['strategy_leakage_rate'] * 100:.2f}%, "
+            f"technical<7={audit['technical_correctness_below_7_rate'] * 100:.2f}%, "
+            f"general<7={audit['general_quality_below_7_rate'] * 100:.2f}%"
+        )
+    print("Stage: development only; do not treat this run as confirmatory evidence.")
+
+
+def print_compact(title: str, result: Dict, verbose: bool = False) -> None:
+    if not verbose and (
+        result.get("paired_absolute_quality", {}).get("available")
+        or result.get("paired_prompt_comparison", {}).get("available")
+    ):
+        print_prompt_key_metrics(title, result)
+        return
     print(f"\n{title}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -5015,7 +5822,8 @@ def parse_args() -> argparse.Namespace:
             "exp1", "exp2", "selector", "estimator", "structure_ablation",
             "objective_ablation", "robustness", "job_conditioned",
             "synthetic_suite", "qwen", "prompt_ablation",
-            "prompt_ablation_v2", "prompt_ablation_v21", "analyze", "all",
+            "prompt_ablation_v2", "prompt_ablation_v21",
+            "prompt_ablation_v22", "analyze", "all",
         ],
         default="all",
     )
@@ -5070,13 +5878,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-judge-repeats", type=int, default=3)
     parser.add_argument(
         "--pairwise-judge-repeats", type=int, default=3,
-        help="Blind A/B judge repeats for prompt_ablation_v2/v21",
+        help="Blind A/B judge repeats for prompt_ablation_v2/v21/v22",
     )
     parser.add_argument(
         "--diagnostic-discrimination-repeats", type=int, default=1,
         help=(
             "Blind H0/H1 classification repeats per question for "
-            "prompt_ablation_v21; use 0 to disable"
+            "prompt_ablation_v21/v22; use 0 to disable"
         ),
     )
     parser.add_argument("--quality-threshold", type=float, default=7.0)
@@ -5094,6 +5902,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen-questions", type=int, default=12)
     parser.add_argument("--request-delay", type=float, default=0.2)
     parser.add_argument("--confirm-api-calls", action="store_true")
+    parser.add_argument(
+        "--verbose-results",
+        action="store_true",
+        help=(
+            "Print complete result JSON. By default prompt-ablation modes print "
+            "only pre-registered key metrics; full results are always saved."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -5134,7 +5950,7 @@ def main() -> None:
 
     if args.mode in ("exp1", "all"):
         result = run_exp1(output_root, args.candidates, args.seed)
-        print_compact("Exp. 1 complete", result)
+        print_compact("Exp. 1 complete", result, verbose=args.verbose_results)
 
     if args.mode in ("exp2", "selector", "all"):
         result = run_exp2(
@@ -5148,42 +5964,54 @@ def main() -> None:
             profile_regime=args.profile_regime,
             misspecification_rate=args.misspecification_rate,
         )
-        print_compact("Exp. 2 complete", result)
+        print_compact("Exp. 2 complete", result, verbose=args.verbose_results)
 
     if args.mode in ("estimator", "synthetic_suite"):
         result = run_estimator_benchmark(
             output_root, args.seeds, args.candidates, args.questions, args.seed,
             args.profile_regimes, args.job_profile,
         )
-        print_compact("Estimator benchmark complete", result)
+        print_compact(
+            "Estimator benchmark complete", result, verbose=args.verbose_results,
+        )
 
     if args.mode in ("structure_ablation", "synthetic_suite"):
         result = run_structure_ablation(
             output_root, args.seeds, args.candidates, args.questions, args.seed,
         )
-        print_compact("Structure ablation complete", result)
+        print_compact(
+            "Structure ablation complete", result, verbose=args.verbose_results,
+        )
 
     if args.mode in ("objective_ablation", "synthetic_suite"):
         result = run_objective_ablation(
             output_root, args.seeds, args.candidates, args.questions, args.seed,
         )
-        print_compact("Objective ablation complete", result)
+        print_compact(
+            "Objective ablation complete", result, verbose=args.verbose_results,
+        )
 
     if args.mode in ("robustness", "synthetic_suite"):
         result = run_robustness_benchmark(
             output_root, args.seeds, args.candidates, args.questions, args.seed,
         )
-        print_compact("Robustness benchmark complete", result)
+        print_compact(
+            "Robustness benchmark complete", result, verbose=args.verbose_results,
+        )
 
     if args.mode in ("job_conditioned", "synthetic_suite"):
         result = run_job_conditioned_benchmark(
             output_root, args.seeds, args.candidates, args.questions, args.seed,
             args.job_profiles,
         )
-        print_compact("Job-conditioned benchmark complete", result)
+        print_compact(
+            "Job-conditioned benchmark complete", result,
+            verbose=args.verbose_results,
+        )
 
     if args.mode in (
-        "qwen", "prompt_ablation", "prompt_ablation_v2", "prompt_ablation_v21",
+        "qwen", "prompt_ablation", "prompt_ablation_v2",
+        "prompt_ablation_v21", "prompt_ablation_v22",
     ):
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
@@ -5249,17 +6077,25 @@ def main() -> None:
         }
         if args.mode == "qwen":
             result = run_qwen(strategies=args.strategies, **common)
-            print_compact("Qwen pilot complete", result)
+            print_compact(
+                "Qwen pilot complete", result, verbose=args.verbose_results,
+            )
         elif args.mode == "prompt_ablation":
             result = run_prompt_ablation(**common)
-            print_compact("Fixed-target prompt ablation complete", result)
+            print_compact(
+                "Fixed-target prompt ablation complete", result,
+                verbose=args.verbose_results,
+            )
         elif args.mode == "prompt_ablation_v2":
             result = run_prompt_ablation_v2(
                 pairwise_judge_repeats=args.pairwise_judge_repeats,
                 **common,
             )
-            print_compact("V2 fixed-target prompt ablation complete", result)
-        else:
+            print_compact(
+                "V2 fixed-target prompt ablation complete", result,
+                verbose=args.verbose_results,
+            )
+        elif args.mode == "prompt_ablation_v21":
             result = run_prompt_ablation_v21(
                 pairwise_judge_repeats=args.pairwise_judge_repeats,
                 diagnostic_discrimination_repeats=(
@@ -5267,7 +6103,22 @@ def main() -> None:
                 ),
                 **common,
             )
-            print_compact("V2.1 fixed-target prompt ablation complete", result)
+            print_compact(
+                "V2.1 fixed-target prompt ablation complete", result,
+                verbose=args.verbose_results,
+            )
+        else:
+            result = run_prompt_ablation_v22(
+                pairwise_judge_repeats=args.pairwise_judge_repeats,
+                diagnostic_discrimination_repeats=(
+                    args.diagnostic_discrimination_repeats
+                ),
+                **common,
+            )
+            print_compact(
+                "V2.2 answerability-first prompt ablation complete", result,
+                verbose=args.verbose_results,
+            )
 
 
 if __name__ == "__main__":
