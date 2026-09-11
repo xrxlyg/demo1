@@ -3509,11 +3509,26 @@ def parse_v24_probe_json(
     indices = data["required_fact_indices"]
     if not task or not answer or not evidence or not answerability:
         raise ValueError("V2.4 probe text fields cannot be empty")
-    if not isinstance(indices, list) or not indices:
-        raise ValueError("V2.4 probe requires required_fact_indices")
-    parsed_indices = sorted(set(int(value) for value in indices))
-    if any(value < 1 or value > fact_count for value in parsed_indices):
-        raise ValueError("V2.4 probe references a missing shared fact")
+    if not isinstance(indices, list):
+        raise ValueError("V2.4 required_fact_indices must be a list")
+    parsed_indices = []
+    invalid_indices = [] if indices else ["<empty>"]
+    for value in indices:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            invalid_indices.append(str(value)[:80])
+            continue
+        if 1 <= parsed <= fact_count:
+            parsed_indices.append(parsed)
+        else:
+            invalid_indices.append(parsed)
+    parsed_indices = sorted(set(parsed_indices))
+    if not parsed_indices:
+        # required_fact_indices is audit metadata rather than question content.
+        # A model indexing mistake must not discard or stop an otherwise valid
+        # generated question; the shared scenario already contains every fact.
+        parsed_indices = list(range(1, fact_count + 1))
     if task.count("?") + task.count("？") != 1:
         raise ValueError("V2.4 single_task must contain exactly one question mark")
     if "\n" in task:
@@ -3524,6 +3539,8 @@ def parse_v24_probe_json(
         "single_task": task,
         "answer_outline": answer,
         "required_fact_indices": parsed_indices,
+        "required_fact_indices_repaired": bool(invalid_indices),
+        "invalid_required_fact_indices": invalid_indices,
         "evidence_target": evidence,
         "answerability_check": answerability,
     }
@@ -3638,6 +3655,12 @@ def generate_v24_shared_fact_question(
             "single_task": probe["single_task"],
             "answer_outline": probe["answer_outline"],
             "required_fact_indices": probe["required_fact_indices"],
+            "required_fact_indices_repaired": probe[
+                "required_fact_indices_repaired"
+            ],
+            "invalid_required_fact_indices": probe[
+                "invalid_required_fact_indices"
+            ],
             "evidence_target": probe["evidence_target"],
             "answerability_check": probe["answerability_check"],
             "probe_model_raw_output": probe.get("raw", ""),

@@ -50,7 +50,7 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
                     if is_tree else "此次响应变更是否向后兼容？"
                 ),
                 "answer_outline": "旧客户端忽略新增可选字段，因此仍可解析原有字段",
-                "required_fact_indices": [1, 2],
+                "required_fact_indices": [1, 2, 9],
                 "evidence_target": (
                     "把客户端解析行为与兼容性结论连接为因果链"
                     if is_tree else "识别兼容性"
@@ -441,6 +441,17 @@ class QwenPipelineTest(unittest.TestCase):
                     self.assertEqual(
                         plain_attempt["shared_factual_scaffold"],
                         tree_attempt["shared_factual_scaffold"],
+                    )
+                    self.assertEqual(plain_attempt["required_fact_indices"], [1, 2])
+                    self.assertEqual(tree_attempt["required_fact_indices"], [1, 2])
+                    self.assertTrue(
+                        plain_attempt["required_fact_indices_repaired"]
+                    )
+                    self.assertTrue(
+                        tree_attempt["required_fact_indices_repaired"]
+                    )
+                    self.assertEqual(
+                        plain_attempt["invalid_required_fact_indices"], [9]
                     )
                     self.assertTrue(
                         pair["pairwise_evaluation"]["strict_technical_gate"]
