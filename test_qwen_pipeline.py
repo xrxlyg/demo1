@@ -27,7 +27,37 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
         type(self).calls.append(payload)
         system = payload["messages"][0]["content"]
 
-        if "V2.3技术脚手架规划器" in system:
+        if "V2.4共享技术场景规划器" in system:
+            content = json.dumps({
+                "core_concept": "API向后兼容",
+                "scenario_text": (
+                    "现有客户端会忽略响应中的未知可选字段，本次变更只新增一个可选"
+                    "响应字段"
+                ),
+                "stable_facts": [
+                    "现有客户端忽略响应中的未知可选字段",
+                    "本次变更只新增一个可选响应字段",
+                ],
+                "answerable_scope": "可判断旧客户端解析行为及此次响应变更的兼容性",
+                "assumptions_to_avoid": ["不假设客户端会自动升级"],
+            }, ensure_ascii=False)
+        elif "V2.4技术面试探针设计器" in system:
+            probe_input = payload["messages"][1]["content"]
+            is_tree = "较低状态：" in probe_input
+            content = json.dumps({
+                "single_task": (
+                    "请推演旧客户端收到新响应时的解析结果及其兼容性？"
+                    if is_tree else "此次响应变更是否向后兼容？"
+                ),
+                "answer_outline": "旧客户端忽略新增可选字段，因此仍可解析原有字段",
+                "required_fact_indices": [1, 2],
+                "evidence_target": (
+                    "把客户端解析行为与兼容性结论连接为因果链"
+                    if is_tree else "识别兼容性"
+                ),
+                "answerability_check": "结论只依赖两项共享事实",
+            }, ensure_ascii=False)
+        elif "V2.3技术脚手架规划器" in system:
             content = json.dumps({
                 "core_concept": "API向后兼容",
                 "stable_facts": [
@@ -341,6 +371,96 @@ class QwenPipelineTest(unittest.TestCase):
                     )
                 self.assertIn("Blind Tree preference", first.stdout)
                 self.assertIn("Estimated planned API calls", first.stdout)
+
+                calls_after_first = len(FakeDashScopeHandler.calls)
+                second = subprocess.run(
+                    command, cwd=ROOT, env=environment, text=True,
+                    capture_output=True, check=True,
+                )
+                self.assertEqual(len(FakeDashScopeHandler.calls), calls_after_first)
+                self.assertIn("3/3", second.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_v24_shared_facts_distinct_probes_and_resume(self):
+        FakeDashScopeHandler.calls = []
+        FakeDashScopeHandler.generated_questions = 0
+        FakeDashScopeHandler.invalid_question_judge_once = False
+        FakeDashScopeHandler.invalid_answer_judge_once = False
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeDashScopeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                command = [
+                    sys.executable,
+                    str(ROOT / "experiment_all_in_one.py"),
+                    "--mode", "prompt_ablation_v24",
+                    "--base-url", f"http://127.0.0.1:{server.server_port}/v1",
+                    "--qwen-candidates", "3",
+                    "--qwen-questions", "1",
+                    "--question-judge-repeats", "1",
+                    "--pairwise-judge-repeats", "1",
+                    "--diagnostic-discrimination-repeats", "1",
+                    "--request-delay", "0",
+                    "--confirm-api-calls",
+                    "--output", output,
+                ]
+                environment = dict(os.environ, DASHSCOPE_API_KEY="test-only-key")
+                first = subprocess.run(
+                    command, cwd=ROOT, env=environment, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(first.returncode, 0, first.stderr)
+                experiment_dir = Path(output) / "exp9_prompt_ablation_v24"
+                pairs = [
+                    json.loads(line)
+                    for line in (experiment_dir / "pairs.jsonl").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+                self.assertEqual(len(pairs), 3)
+                self.assertEqual(len(FakeDashScopeHandler.calls), 33)
+                for pair in pairs:
+                    self.assertEqual(set(pair["variants"]), {
+                        "prompt_plain_v24", "prompt_tree_v24",
+                    })
+                    scenario = pair["shared_factual_scaffold"]["scenario_text"]
+                    plain_attempt = pair["variants"]["prompt_plain_v24"][
+                        "question_generation_attempts"
+                    ][0]
+                    tree_attempt = pair["variants"]["prompt_tree_v24"][
+                        "question_generation_attempts"
+                    ][0]
+                    self.assertTrue(plain_attempt["question"].startswith(scenario))
+                    self.assertTrue(tree_attempt["question"].startswith(scenario))
+                    self.assertNotEqual(
+                        plain_attempt["single_task"], tree_attempt["single_task"]
+                    )
+                    self.assertEqual(
+                        plain_attempt["shared_factual_scaffold"],
+                        tree_attempt["shared_factual_scaffold"],
+                    )
+                    self.assertTrue(
+                        pair["pairwise_evaluation"]["strict_technical_gate"]
+                    )
+                    for generated in pair["variants"].values():
+                        self.assertTrue(
+                            generated["counterfactual_discrimination"][
+                                "responsive_only"
+                            ]
+                        )
+                self.assertIn("Blind Tree preference", first.stdout)
+                self.assertNotIn('"question_model"', first.stdout)
+                analysis_report = json.loads(
+                    (experiment_dir / "quality_analysis" /
+                     "question_quality_summary.json").read_text(encoding="utf-8")
+                )
+                self.assertIn(
+                    "prompt_tree_v24_vs_prompt_plain_v24",
+                    analysis_report["paired_comparisons"],
+                )
 
                 calls_after_first = len(FakeDashScopeHandler.calls)
                 second = subprocess.run(
