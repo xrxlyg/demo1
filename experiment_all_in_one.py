@@ -13,12 +13,16 @@ Included:
   3. Tree-BRIDGE, Tree-Random, uncertainty, fixed, and propagation ablations.
   4. Synthetic estimator/selector experiments and an optional Qwen pilot.
   5. Fixed-target prompt ablation and candidate-paired quality analysis.
+  6. V2 contrast-card prompting, budget-matched draft/revision, and blind A/B judging.
 
 Examples:
   python experiment_all_in_one.py --mode exp1 --output runs
   python experiment_all_in_one.py --mode exp2 --seeds 20 --output runs
   python experiment_all_in_one.py --mode prompt_ablation \
       --qwen-candidates 3 --qwen-questions 3 --confirm-api-calls --output runs
+  python experiment_all_in_one.py --mode prompt_ablation_v2 \
+      --qwen-candidates 3 --qwen-questions 3 --pairwise-judge-repeats 3 \
+      --confirm-api-calls --output runs_v2
   python experiment_all_in_one.py --mode all  --seeds 20 --output runs
   python experiment_all_in_one.py --mode analyze --output runs
 
@@ -389,6 +393,17 @@ def append_jsonl(path: Path, record: Dict) -> None:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def write_jsonl_atomic(path: Path, records: Sequence[Mapping]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
 
 
 def load_jsonl(path: Path) -> List[Dict]:
@@ -1991,6 +2006,92 @@ COMPOSITE_QUALITY_METRICS = (
 )
 
 
+# The V2 prompt translates posterior numbers into observable evidence.  This is
+# deliberately deterministic: the stronger judge never plans or writes the
+# question, so qwen-turbo remains the question generator.
+BRANCH_DIAGNOSTIC_LENSES: Dict[str, str] = {
+    "Language Foundations": "利用具体程序行为或类型错误解释底层语言机制",
+    "Algorithms": "选择合适算法，推导复杂度并处理一个决定性的边界条件",
+    "Concurrent Programming": "推演一次线程交错并判断对应的安全性或活性后果",
+    "Relational Databases": "把查询或事务行为关联到执行计划、隔离规则或并发异常",
+    "Storage Engines": "追踪一次读写路径并解释持久化、复制或分片权衡",
+    "Caching": "诊断一个缓存故障场景并论证一致性或淘汰决策",
+    "Distributed Fundamentals": "从给定网络或故障假设推导一致性后果",
+    "Consistency and Coordination": "推演一条故障时间线并区分安全性、活性与恢复行为",
+    "Distributed Transactions": "识别部分失败边界并论证补偿、幂等或提交行为",
+    "Messaging Platforms": "在具体消息流中推理顺序、分区或消费者行为",
+    "Delivery Semantics": "追踪重复、丢失或延迟投递并指出必须维持的业务不变量",
+    "Service Integration": "诊断一次跨服务故障并论证接口或服务发现行为",
+    "Containers and Orchestration": "追踪调度或运行状态并定位对应的容器编排机制",
+    "Delivery Automation": "分析一次发布失败并论证回滚、晋级或制品保证",
+    "Cloud Operations": "根据一项事故信号形成诊断并选择可验证的缓解措施",
+    "Architecture": "在明确负载或故障约束下作出一个架构决策并论证权衡",
+    "Interface Design": "处理一个兼容性或契约边界而不进行宽泛的接口重设计",
+    "Performance Engineering": "根据有限证据定位瓶颈并论证一项干预及其代价",
+    "Application Security": "追踪一条真实攻击路径并定位准确的信任或授权边界",
+    "Data Security": "分析一个数据暴露场景并论证对应的密钥、秘密或隐私控制",
+    "Cloud Security": "识别一条权限或供应链路径并在正确边界选择控制措施",
+    "Design Quality": "根据耦合、职责与可维护性评价一项具体代码修改",
+    "Team Practice": "使用可观察工程证据解决一个交付或协作失败",
+    "Sustainable Delivery": "在保持兼容并限制技术债的条件下作出一项变更决策",
+    "Testing Methods": "设计一个能够区分疑似故障与其他合理解释的测试",
+    "Resilience Engineering": "追踪一条故障传播路径并论证隔离或恢复机制",
+    "Quality Engineering": "选择调试、性能分析或静态分析证据以隔离一个根因",
+}
+assert set(BRANCH_DIAGNOSTIC_LENSES) == {
+    branch for branches in CAPABILITY_TREE.values() for branch in branches
+}
+
+
+def posterior_band(value: float) -> str:
+    if value < 3.5:
+        return "基础概念阶段"
+    if value < 5.5:
+        return "基础应用阶段"
+    if value < 7.5:
+        return "具备生产应用能力"
+    return "高级能力阶段"
+
+
+def build_diagnostic_contrast_card(
+    ability_model: BayesianAbilityModel,
+    skill: str,
+    dialogue_history: Sequence[Mapping],
+) -> Dict[str, object]:
+    mean = ability_model.skill_mean(skill)
+    std = math.sqrt(ability_model.skill_variance(skill))
+    lower = clip(mean - std)
+    upper = clip(mean + std)
+    lens = BRANCH_DIAGNOSTIC_LENSES[SKILL_TO_BRANCH[skill]]
+    last = dialogue_history[-1] if dialogue_history else None
+    previous_gap = (
+        "尚无历史回答，需要获取一项能够区分能力状态的决定性证据。"
+        if last is None
+        else (
+            "检验上一轮回答中一个尚未验证的假设或遗漏边界："
+            + str(last.get("answer", ""))[:320]
+        )
+    )
+    forbidden = [str(row.get("question", ""))[:220] for row in dialogue_history[-4:]]
+    return {
+        "estimated_band": posterior_band(mean),
+        "posterior_mean": mean,
+        "posterior_std": std,
+        "lower_state_value": lower,
+        "upper_state_value": upper,
+        "lower_hypothesis": (
+            f"候选人能够陈述{skill}的基本概念，但还不能{lens}。"
+        ),
+        "upper_hypothesis": (
+            f"候选人能够正确{lens}，并论证相应的工程权衡。"
+        ),
+        "required_discriminating_evidence": lens,
+        "previous_answer_gap": previous_gap,
+        "forbidden_repetition": forbidden,
+        "single_task_constraint": True,
+    }
+
+
 def add_quality_composites(scores: Dict[str, float]) -> Dict[str, float]:
     scores["general_question_quality"] = quality_mean([
         scores[name] for name in GENERAL_QUALITY_DIMENSIONS
@@ -2154,6 +2255,24 @@ def generate_qwen_question(
             f"- 诊断目标：{question_context['diagnostic_goal']}\n"
             "只利用最相关信息，设计一个能区分当前两种最可能能力状态的问题；"
             "避免罗列多个子问题，也不要机械复述上述数值。\n"
+        )
+    elif question_context["prompt_variant"] == "tree_v2":
+        card = question_context["diagnostic_contrast_card"]
+        user_parts.append(
+            "分层诊断对比卡（不要在问题中复述这些标签或数值）：\n"
+            f"- 当前能力状态：{card['estimated_band']}，不确定性={card['posterior_std']:.2f}\n"
+            f"- 较低能力假设H0：{card['lower_hypothesis']}\n"
+            f"- 较高能力假设H1：{card['upper_hypothesis']}\n"
+            f"- 必须获得的区分证据：{card['required_discriminating_evidence']}\n"
+            f"- 上一轮尚未验证的缺口：{card['previous_answer_gap']}\n"
+            f"- 禁止重复的问题：{json.dumps(card['forbidden_repetition'], ensure_ascii=False)}\n"
+            "围绕一个具体场景提出一个主要任务，使H0和H1倾向于产生可区分的回答。"
+            "不要询问宽泛定义，不要组合多个并列子问题。\n"
+        )
+    elif question_context["prompt_variant"] == "plain_v2":
+        user_parts.append(
+            "生成一个清晰、技术正确、符合指定难度的单一场景问题。"
+            "避免重复历史问题，不要组合多个并列子问题。\n"
         )
     user_parts.append(
         f"本轮已被拒绝的尝试（必须针对反馈改写且避免重复）：\n{rejected_text}\n"
@@ -2333,6 +2452,234 @@ def generate_qualified_question(
         len(attempts) - 1,
         attempts,
     )
+
+
+def revise_qwen_question(
+    client: QwenClient,
+    model: str,
+    draft: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    question_context: Mapping,
+) -> str:
+    """Use the same low-cost generator for a second, budget-matched revision."""
+    system = (
+        "你是技术面试问题编辑器。只输出修订后的一个中文问题，不给答案、解释、"
+        "标题、评分或Markdown。最多两句话，只允许一个主要任务。"
+    )
+    common = (
+        f"目标技能：{skill}\n目标难度：{difficulty}\n问题初稿：{draft}\n"
+        f"最近历史：{json.dumps(list(dialogue_history)[-2:], ensure_ascii=False)}\n"
+    )
+    if question_context["prompt_variant"] == "tree_v2":
+        card = question_context["diagnostic_contrast_card"]
+        instruction = (
+            "按诊断目标修订：问题必须通过一个具体场景区分H0和H1，并检验上一轮尚未"
+            "验证的一个缺口。不得重复历史问题，不得询问宽泛定义，不得并列多个任务。\n"
+            f"H0：{card['lower_hypothesis']}\n"
+            f"H1：{card['upper_hypothesis']}\n"
+            f"区分证据：{card['required_discriminating_evidence']}\n"
+            f"上一轮缺口：{card['previous_answer_gap']}\n"
+            f"禁止重复：{json.dumps(card['forbidden_repetition'], ensure_ascii=False)}"
+        )
+    else:
+        instruction = (
+            "按通用质量标准修订：确保技术正确、清晰、符合难度，使用一个具体场景，"
+            "避免重复历史问题并删除并列子问题。"
+        )
+    return client.chat(model, system, common + instruction, temperature=0.6, max_tokens=300).strip()
+
+
+def generate_two_stage_question(
+    client: QwenClient,
+    question_model: str,
+    question_judge_model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+    regenerate_low_quality: bool,
+    question_context: Mapping,
+) -> Tuple[str, Dict[str, float], int, List[Dict]]:
+    """Draft, revise, then judge; low-quality outputs remain by default."""
+    attempts = []
+    rejected = []
+    maximum_attempts = max_regenerations + 1 if regenerate_low_quality else 1
+    for attempt_index in range(maximum_attempts):
+        draft_raw = generate_qwen_question(
+            client, question_model, skill, difficulty, dialogue_history,
+            rejected, question_context,
+        )
+        final_question = revise_qwen_question(
+            client, question_model, draft_raw.strip(), skill, difficulty,
+            dialogue_history, question_context,
+        )
+        quality_scores, judge_details = evaluate_qwen_question(
+            client, question_judge_model, skill, difficulty, final_question,
+            dialogue_history, judge_repeats, question_context,
+        )
+        attempts.append({
+            "attempt": attempt_index,
+            "draft_question": draft_raw.strip(),
+            "question": final_question,
+            "question_model_raw_output": final_question,
+            "quality_scores": quality_scores,
+            "question_judge_details": judge_details,
+            "two_stage_revision": True,
+        })
+        if (
+            not regenerate_low_quality
+            or quality_scores["overall_question_quality"] >= quality_threshold
+        ):
+            break
+        rejected.append({
+            "question": final_question,
+            "feedback": "; ".join(
+                row["reason"] for row in judge_details if row["reason"]
+            ),
+        })
+    accepted = attempts[-1]
+    return (
+        accepted["question"], accepted["quality_scores"],
+        len(attempts) - 1, attempts,
+    )
+
+
+def parse_pairwise_judge_json(raw: str) -> Dict[str, object]:
+    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("Pairwise judge output does not contain a JSON object")
+    data = json.loads(cleaned[start:end + 1])
+    winner = str(data["winner"]).strip().upper()
+    if winner not in ("A", "B", "TIE"):
+        raise ValueError(f"Pairwise winner must be A, B, or TIE, got {winner!r}")
+    confidence = float(data.get("confidence", 3.0))
+    if not 1.0 <= confidence <= 5.0:
+        raise ValueError("Pairwise confidence must be within [1,5]")
+    return {
+        "winner": winner,
+        "confidence": confidence,
+        "reason": str(data.get("reason", ""))[:500],
+    }
+
+
+def evaluate_question_pair(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    tree_question: str,
+    plain_question: str,
+    dialogue_history: Sequence[Mapping],
+    question_context: Mapping,
+    repeats: int,
+    pair_id: str,
+) -> Dict[str, object]:
+    """Blind, order-randomized pairwise preference evaluation."""
+    if repeats < 1:
+        raise ValueError("pairwise judge repeats must be at least one")
+    blind_context = {
+        key: value for key, value in question_context.items()
+        if key not in ("prompt_variant", "propagation")
+    }
+    system = (
+        "你是盲评技术面试问题比较器。比较两个问题在当前能力状态下的自适应诊断"
+        "质量，优先判断能否区分给定的较低/较高能力假设及是否承接历史证据；同时"
+        "要求技术正确、清晰且只有一个主要任务。你不知道问题来自哪种策略。只输出"
+        "JSON：winner必须为A、B或TIE，confidence为1到5，reason为简短理由。"
+    )
+    details = []
+    base_tree_is_a = stable_seed("pair-order", pair_id) % 2 == 0
+    for repeat in range(repeats):
+        tree_is_a = base_tree_is_a if repeat % 2 == 0 else not base_tree_is_a
+        question_a = tree_question if tree_is_a else plain_question
+        question_b = plain_question if tree_is_a else tree_question
+        user = (
+            f"目标技能：{skill}\n目标难度：{difficulty}\n"
+            f"诊断上下文：{json.dumps(blind_context, ensure_ascii=False)}\n"
+            f"历史对话：{json.dumps(list(dialogue_history)[-3:], ensure_ascii=False)}\n"
+            f"问题A：{question_a}\n问题B：{question_b}"
+        )
+        judged = request_judge_json(
+            client, model, system, user, parse_pairwise_judge_json, max_tokens=350,
+        )
+        displayed_winner = str(judged["winner"])
+        if displayed_winner == "TIE":
+            canonical_winner = "tie"
+        elif (displayed_winner == "A") == tree_is_a:
+            canonical_winner = "prompt_tree_v2"
+        else:
+            canonical_winner = "prompt_plain_v2"
+        judged.update({
+            "repeat": repeat,
+            "tree_display_position": "A" if tree_is_a else "B",
+            "canonical_winner": canonical_winner,
+        })
+        details.append(judged)
+    tree_wins = sum(row["canonical_winner"] == "prompt_tree_v2" for row in details)
+    plain_wins = sum(row["canonical_winner"] == "prompt_plain_v2" for row in details)
+    ties = len(details) - tree_wins - plain_wins
+    majority = (
+        "prompt_tree_v2" if tree_wins > plain_wins
+        else "prompt_plain_v2" if plain_wins > tree_wins
+        else "tie"
+    )
+    return {
+        "judge_repeats": repeats,
+        "tree_wins": tree_wins,
+        "plain_wins": plain_wins,
+        "ties": ties,
+        "tree_preference_score": (tree_wins + 0.5 * ties) / repeats,
+        "majority_winner": majority,
+        "details": details,
+    }
+
+
+def select_diagnostic_challenge_skill(
+    model: BayesianAbilityModel,
+    recent: Sequence[str],
+) -> Tuple[str, str, Dict[str, float]]:
+    """Choose an uncertainty frontier without forcing domain coverage."""
+    candidates = []
+    job_variance = model.job_variance()
+    total_variance = model.total_variance()
+    max_variance = max(model.skill_variance(skill) for skill in SKILLS)
+    raw = []
+    for skill in SKILLS:
+        difficulty = closest_difficulty(model.skill_mean(skill))
+        components = model.risk_components(
+            skill, difficulty, recent, job_variance, total_variance,
+        )
+        siblings = CAPABILITY_TREE[SKILL_TO_CLUSTER[skill]][SKILL_TO_BRANCH[skill]]
+        sibling_mean = sum(model.skill_mean(name) for name in siblings) / len(siblings)
+        disagreement = min(abs(model.skill_mean(skill) - sibling_mean) / 2.0, 1.0)
+        uncertainty = model.skill_variance(skill) / max(max_variance, _EPS)
+        linkage = float(any(
+            SKILL_TO_BRANCH.get(name) == SKILL_TO_BRANCH[skill] for name in recent
+        ))
+        raw.append((skill, difficulty, components, uncertainty, disagreement, linkage))
+    max_utility = max(item[2]["utility"] for item in raw)
+    for skill, difficulty, components, uncertainty, disagreement, linkage in raw:
+        normalized_utility = components["utility"] / max(max_utility, _EPS)
+        score = (
+            0.45 * uncertainty + 0.25 * disagreement
+            + 0.20 * normalized_utility + 0.10 * linkage
+        ) / components["question_cost"]
+        enriched = dict(components)
+        enriched.update({
+            "diagnostic_challenge_score": score,
+            "challenge_uncertainty": uncertainty,
+            "challenge_sibling_disagreement": disagreement,
+            "challenge_history_linkage": linkage,
+        })
+        candidates.append((score, skill, difficulty, enriched))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    _, skill, difficulty, components = candidates[0]
+    return skill, difficulty, components
 
 
 def generate_qwen_answer(
@@ -2910,6 +3257,348 @@ def run_prompt_ablation(
     return summary
 
 
+def flatten_v2_prompt_pairs(pairs: Sequence[Mapping]) -> List[Dict]:
+    rows = []
+    for pair in pairs:
+        for variant, generated in pair["variants"].items():
+            scores = generated["quality_scores"]
+            rows.append({
+                "created_at": pair["created_at"],
+                "strategy": variant,
+                "candidate_id": pair["candidate_id"],
+                "level": pair["level"],
+                "turn": pair["turn"],
+                "pair_id": pair["pair_id"],
+                "history_snapshot_sha256": pair["history_snapshot_sha256"],
+                "skill": pair["skill"],
+                "cluster": pair["cluster"],
+                "branch": pair["branch"],
+                "capability_path": pair["capability_path"],
+                "difficulty": pair["difficulty"],
+                "question_prompt_variant": generated["question_context"]["prompt_variant"],
+                "question_context": generated["question_context"],
+                "question": generated["question"],
+                "question_quality_scores": {
+                    name: scores[name] for name in QUESTION_QUALITY_DIMENSIONS
+                },
+                "general_question_quality": scores["general_question_quality"],
+                "adaptive_diagnostic_quality": scores["adaptive_diagnostic_quality"],
+                "overall_question_quality": scores["overall_question_quality"],
+                "quality_threshold": pair["quality_threshold"],
+                "quality_gate_enabled": pair["quality_gate_enabled"],
+                "quality_threshold_met": (
+                    scores["overall_question_quality"] >= pair["quality_threshold"]
+                ),
+                "regeneration_count": generated["regeneration_count"],
+                "question_generation_attempts": generated["question_generation_attempts"],
+                "canonical_question": pair["canonical_question"],
+                "answer": pair["answer"],
+                "assigned_skill_theta": pair["assigned_skill_theta"],
+                "ability_observation_source": "deterministic_latent_simulation",
+                "ability_observation_score": pair["ability_observation_score"],
+                "ability_observation_std": pair["ability_observation_std"],
+                "posterior_skill_mean": pair["posterior_skill_mean"],
+                "posterior_skill_std": pair["posterior_skill_std"],
+                "posterior_job_mean": pair["posterior_job_mean"],
+                "posterior_job_std": pair["posterior_job_std"],
+                "realized_job_variance_reduction": pair["realized_job_variance_reduction"],
+                "realized_global_variance_reduction": pair["realized_global_variance_reduction"],
+                "realized_hierarchy_variance_reduction": pair[
+                    "realized_hierarchy_variance_reduction"
+                ],
+                "selector": pair["selector"],
+                "pairwise_tree_preference_score": pair["pairwise_evaluation"][
+                    "tree_preference_score"
+                ],
+                "pairwise_majority_winner": pair["pairwise_evaluation"][
+                    "majority_winner"
+                ],
+            })
+    return rows
+
+
+def summarize_pairwise_preferences(pairs: Sequence[Mapping]) -> Dict[str, object]:
+    if not pairs:
+        return {"available": False, "reason": "No V2 prompt pairs"}
+    candidate_scores: Dict[object, List[float]] = defaultdict(list)
+    repeat_winners: List[str] = []
+    majority_winners: List[str] = []
+    confidences: List[float] = []
+    order_a = 0
+    for pair in pairs:
+        evaluation = pair["pairwise_evaluation"]
+        candidate_scores[pair["candidate_id"]].append(
+            float(evaluation["tree_preference_score"])
+        )
+        majority_winners.append(str(evaluation["majority_winner"]))
+        for detail in evaluation["details"]:
+            repeat_winners.append(str(detail["canonical_winner"]))
+            confidences.append(float(detail["confidence"]))
+            order_a += int(detail["tree_display_position"] == "A")
+    per_candidate = [quality_mean(values) for values in candidate_scores.values()]
+    centered = [value - 0.5 for value in per_candidate]
+    ci_low, ci_high = bootstrap_mean_ci(
+        per_candidate, seed=stable_seed("v2-pairwise-bootstrap", len(pairs))
+    )
+    std = quality_sample_std(centered)
+    return {
+        "available": True,
+        "unit": "candidate mean across matched targets",
+        "n_pairs": len(pairs),
+        "n_candidates": len(per_candidate),
+        "judge_repeats_per_pair": len(repeat_winners) / len(pairs),
+        "tree_preference_score": quality_mean(per_candidate),
+        "tree_preference_bootstrap_95_ci_low": ci_low,
+        "tree_preference_bootstrap_95_ci_high": ci_high,
+        "preference_effect_over_chance": quality_mean(centered),
+        "paired_effect_size_dz": quality_mean(centered) / std if std > 0 else 0.0,
+        "paired_sign_flip_p": paired_sign_flip_p(
+            centered, seed=stable_seed("v2-pairwise-sign-flip", len(pairs))
+        ),
+        "repeat_vote_tree_rate": repeat_winners.count("prompt_tree_v2") / len(repeat_winners),
+        "repeat_vote_tie_rate": repeat_winners.count("tie") / len(repeat_winners),
+        "repeat_vote_plain_rate": repeat_winners.count("prompt_plain_v2") / len(repeat_winners),
+        "pair_majority_tree_rate": majority_winners.count("prompt_tree_v2") / len(pairs),
+        "pair_majority_tie_rate": majority_winners.count("tie") / len(pairs),
+        "pair_majority_plain_rate": majority_winners.count("prompt_plain_v2") / len(pairs),
+        "mean_judge_confidence": quality_mean(confidences),
+        "tree_displayed_as_a_rate": order_a / len(repeat_winners),
+        "note": "Question order is deterministically randomized per pair and judge repeat.",
+    }
+
+
+def run_prompt_ablation_v2(
+    output_root: Path,
+    api_key: str,
+    base_url: str,
+    question_model: str,
+    question_judge_model: str,
+    candidate_model: str,
+    n_candidates: int,
+    questions: int,
+    question_judge_repeats: int,
+    pairwise_judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+    regenerate_low_quality: bool,
+    seed: int,
+    request_delay: float,
+) -> Dict:
+    """V2 fixed-target ablation with contrast cards and blind pairwise judging."""
+    output_dir = output_root / "exp5_prompt_ablation_v2"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    profiles_path = output_dir / "profiles.json"
+    pairs_path = output_dir / "pairs.jsonl"
+    turns_path = output_dir / "turns.jsonl"
+    setup_path = output_dir / "setup.json"
+    profiles = generate_profiles(n_candidates, seed)
+    variants = ("prompt_plain_v2", "prompt_tree_v2")
+    setup = {
+        "schema_version": 1,
+        "seed": seed,
+        "question_model": question_model,
+        "question_judge_model": question_judge_model,
+        "candidate_model": candidate_model,
+        "question_judge_repeats": question_judge_repeats,
+        "pairwise_judge_repeats": pairwise_judge_repeats,
+        "quality_threshold": quality_threshold,
+        "max_regenerations": max_regenerations,
+        "regenerate_low_quality": regenerate_low_quality,
+        "ability_update_source": "deterministic_latent_simulation",
+        "candidates": n_candidates,
+        "questions": questions,
+        "prompt_variants": list(variants),
+        "generation_pipeline": "qwen-turbo draft then qwen-turbo budget-matched revision",
+        "target_sampling": "diagnostic uncertainty frontier; identical target for both variants",
+        "pairwise_order": "blind deterministic randomization per repeat",
+        "primary_metric": "adaptive_diagnostic_quality",
+        "general_quality_role": "non-inferiority safeguard; recommended margin -0.10",
+    }
+    if setup_path.exists():
+        saved_setup = json.loads(setup_path.read_text(encoding="utf-8"))
+        if saved_setup != setup:
+            raise ValueError(
+                "Existing V2 setup does not match this run; use the original "
+                "arguments or a different --output directory"
+            )
+    else:
+        atomic_json(setup_path, setup)
+    serialized_profiles = [asdict(profile) for profile in profiles]
+    if profiles_path.exists():
+        if json.loads(profiles_path.read_text(encoding="utf-8")) != serialized_profiles:
+            raise ValueError("Existing V2 profiles do not match the requested seed/setup")
+    else:
+        atomic_json(profiles_path, serialized_profiles)
+
+    existing = load_jsonl(pairs_path)
+    grouped: Dict[object, List[Dict]] = defaultdict(list)
+    seen = set()
+    for pair in existing:
+        key = (pair["candidate_id"], pair["turn"])
+        if key in seen:
+            raise ValueError(f"Duplicate V2 pair record: {key}")
+        seen.add(key)
+        if set(pair["variants"]) != set(variants):
+            raise ValueError(f"Incomplete V2 pair record: {key}")
+        grouped[pair["candidate_id"]].append(pair)
+    for candidate_id, rows in grouped.items():
+        rows.sort(key=lambda row: int(row["turn"]))
+        turns = [int(row["turn"]) for row in rows]
+        if turns != list(range(len(turns))) or len(turns) > questions:
+            raise ValueError(f"Non-contiguous V2 pairs for candidate {candidate_id}")
+
+    client = QwenClient(api_key, base_url)
+    total = n_candidates * questions
+    with tqdm(total=total, initial=len(existing), desc="V2 fixed-target prompt pairs") as progress:
+        for profile in profiles:
+            model = BayesianAbilityModel(propagation="tree")
+            per_skill_count: Dict[str, int] = defaultdict(int)
+            history = []
+            completed = grouped[profile.candidate_id]
+            for pair in completed:
+                model.update(
+                    pair["skill"], pair["ability_observation_score"],
+                    observation_std=pair["ability_observation_std"],
+                )
+                per_skill_count[pair["skill"]] += 1
+                history.append({
+                    "turn": pair["turn"],
+                    "skill": pair["skill"],
+                    "question": pair["canonical_question"],
+                    "answer": pair["answer"],
+                    "ability_observation_score": pair["ability_observation_score"],
+                    "ability_observation_std": pair["ability_observation_std"],
+                })
+
+            for turn in range(len(completed), questions):
+                recent = [row["skill"] for row in history[-6:]]
+                skill, difficulty, components = select_diagnostic_challenge_skill(
+                    model, recent,
+                )
+                base_context = build_question_context(
+                    "bridge", model, skill, components, history,
+                )
+                base_context["diagnostic_contrast_card"] = build_diagnostic_contrast_card(
+                    model, skill, history,
+                )
+                history_hash = hashlib.sha256(
+                    json.dumps(history, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                pair_id = f"v2-c{profile.candidate_id:03d}-t{turn:03d}"
+                generated: Dict[str, Dict] = {}
+                generation_order = list(variants)
+                if stable_seed("v2-generation-order", pair_id) % 2:
+                    generation_order.reverse()
+                for variant in generation_order:
+                    context = dict(base_context)
+                    context["prompt_variant"] = (
+                        "tree_v2" if variant == "prompt_tree_v2" else "plain_v2"
+                    )
+                    question, scores, regeneration_count, attempts = (
+                        generate_two_stage_question(
+                            client, question_model, question_judge_model,
+                            skill, difficulty, history, question_judge_repeats,
+                            quality_threshold, max_regenerations,
+                            regenerate_low_quality, context,
+                        )
+                    )
+                    generated[variant] = {
+                        "question": question,
+                        "quality_scores": scores,
+                        "regeneration_count": regeneration_count,
+                        "question_generation_attempts": attempts,
+                        "question_context": context,
+                    }
+
+                pairwise = evaluate_question_pair(
+                    client, question_judge_model, skill, difficulty,
+                    generated["prompt_tree_v2"]["question"],
+                    generated["prompt_plain_v2"]["question"],
+                    history, base_context, pairwise_judge_repeats, pair_id,
+                )
+                canonical_question = generated["prompt_tree_v2"]["question"]
+                answer = generate_qwen_answer(
+                    client, candidate_model, profile, skill, canonical_question,
+                )
+                job_before = model.job_variance()
+                total_before = model.total_variance()
+                hierarchy_before = model.hierarchy_variance(skill)
+                ability_score, ability_std = simulate_score(
+                    profile, skill, difficulty, per_skill_count[skill], seed,
+                )
+                model.update(skill, ability_score, observation_std=ability_std)
+                per_skill_count[skill] += 1
+                pair = {
+                    "created_at": utc_now(),
+                    "candidate_id": profile.candidate_id,
+                    "level": profile.level,
+                    "turn": turn,
+                    "pair_id": pair_id,
+                    "history_snapshot_sha256": history_hash,
+                    "generation_order": generation_order,
+                    "skill": skill,
+                    "cluster": SKILL_TO_CLUSTER[skill],
+                    "branch": SKILL_TO_BRANCH[skill],
+                    "capability_path": list(SKILL_PATHS[skill]),
+                    "difficulty": difficulty,
+                    "quality_threshold": quality_threshold,
+                    "quality_gate_enabled": regenerate_low_quality,
+                    "variants": generated,
+                    "pairwise_evaluation": pairwise,
+                    "canonical_question": canonical_question,
+                    "answer": answer,
+                    "assigned_skill_theta": profile.skill_theta[skill],
+                    "ability_observation_score": ability_score,
+                    "ability_observation_std": ability_std,
+                    "posterior_skill_mean": model.skill_mean(skill),
+                    "posterior_skill_std": math.sqrt(model.skill_variance(skill)),
+                    "posterior_job_mean": model.job_mean(),
+                    "posterior_job_std": math.sqrt(model.job_variance()),
+                    "realized_job_variance_reduction": job_before - model.job_variance(),
+                    "realized_global_variance_reduction": total_before - model.total_variance(),
+                    "realized_hierarchy_variance_reduction": (
+                        hierarchy_before - model.hierarchy_variance(skill)
+                    ),
+                    "selector": components,
+                }
+                append_jsonl(pairs_path, pair)
+                grouped[profile.candidate_id].append(pair)
+                history.append({
+                    "turn": turn,
+                    "skill": skill,
+                    "question": canonical_question,
+                    "answer": answer,
+                    "ability_observation_score": ability_score,
+                    "ability_observation_std": ability_std,
+                })
+                progress.update(1)
+                time.sleep(max(request_delay, 0.0))
+
+    pairs = load_jsonl(pairs_path)
+    rows = flatten_v2_prompt_pairs(pairs)
+    write_jsonl_atomic(turns_path, rows)
+    result = {
+        "warning": (
+            "Candidates are Qwen simulations, not humans. Pairwise order is blind "
+            "and randomized; all generated questions are retained by default."
+        ),
+        "setup": setup,
+        "summary": {
+            variant: summarize_question_records([
+                row for row in rows if row["strategy"] == variant
+            ])
+            for variant in variants
+        },
+        "paired_absolute_quality": paired_question_quality_comparison(
+            rows, "prompt_tree_v2", "prompt_plain_v2",
+        ),
+        "blind_pairwise_preference": summarize_pairwise_preferences(pairs),
+    }
+    atomic_json(output_dir / "summary.json", result)
+    run_question_quality_analysis(turns_path, output_dir / "quality_analysis")
+    return result
+
+
 # =============================================================================
 # Question-quality analysis (kept here so the experiment needs one Python file)
 # =============================================================================
@@ -3244,7 +3933,10 @@ def paired_question_quality_comparison(
         "note": (
             "Both prompt variants use the same capability path, skill, difficulty, "
             "posterior state, dialogue history, and candidate state."
-            if (first, second) == ("prompt_tree", "prompt_plain")
+            if (first, second) in (
+                ("prompt_tree", "prompt_plain"),
+                ("prompt_tree_v2", "prompt_plain_v2"),
+            )
             else "Strategies select different skills and difficulties, so this paired "
                  "delta measures end-to-end sequence quality rather than generator "
                  "quality alone."
@@ -3306,6 +3998,7 @@ def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
             ("tree_bridge", "flat_bridge"),
             ("tree_bridge", "independent_bridge"),
             ("prompt_tree", "prompt_plain"),
+            ("prompt_tree_v2", "prompt_plain_v2"),
         )
         if set(pair).issubset(available_strategies)
     ]
@@ -3335,7 +4028,7 @@ def run_question_quality_analysis(input_path: Path, output_dir: Path) -> Dict:
             "Question-quality scores never enter BayesianAbilityModel.",
             "Turns from the same candidate are repeated measures; candidate means are paired.",
             "Different strategies select different skill/difficulty mixtures; inspect stratified CSV files.",
-            "Fixed-target prompt_tree vs prompt_plain rows hold path, difficulty, history, and state constant.",
+            "Fixed-target prompt variants hold path, difficulty, history, and state constant.",
         ],
     }
     atomic_json(output_dir / "question_quality_summary.json", report)
@@ -3387,7 +4080,8 @@ def parse_args() -> argparse.Namespace:
         "--mode", choices=[
             "exp1", "exp2", "selector", "estimator", "structure_ablation",
             "objective_ablation", "robustness", "job_conditioned",
-            "synthetic_suite", "qwen", "prompt_ablation", "analyze", "all",
+            "synthetic_suite", "qwen", "prompt_ablation",
+            "prompt_ablation_v2", "analyze", "all",
         ],
         default="all",
     )
@@ -3440,6 +4134,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-model", default="qwen-turbo")
     parser.add_argument("--question-judge-model", default="qwen-max")
     parser.add_argument("--question-judge-repeats", type=int, default=3)
+    parser.add_argument(
+        "--pairwise-judge-repeats", type=int, default=3,
+        help="Blind A/B judge repeats for prompt_ablation_v2",
+    )
     parser.add_argument("--quality-threshold", type=float, default=7.0)
     parser.add_argument("--max-regenerations", type=int, default=2)
     parser.add_argument(
@@ -3543,7 +4241,7 @@ def main() -> None:
         )
         print_compact("Job-conditioned benchmark complete", result)
 
-    if args.mode in ("qwen", "prompt_ablation"):
+    if args.mode in ("qwen", "prompt_ablation", "prompt_ablation_v2"):
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
             raise SystemExit(
@@ -3551,6 +4249,8 @@ def main() -> None:
             )
         if args.question_judge_repeats < 1:
             raise SystemExit("--question-judge-repeats must be at least one")
+        if args.pairwise_judge_repeats < 1:
+            raise SystemExit("--pairwise-judge-repeats must be at least one")
         if not 1.0 <= args.quality_threshold <= 10.0:
             raise SystemExit("--quality-threshold must be within [1,10]")
         if args.max_regenerations < 0:
@@ -3564,8 +4264,14 @@ def main() -> None:
                 args.qwen_candidates * len(args.strategies)
                 * args.qwen_questions * calls_per_turn
             )
-        else:
+        elif args.mode == "prompt_ablation":
             calls_per_pair = 2 * question_attempts * (1 + args.question_judge_repeats) + 1
+            estimated_calls = args.qwen_candidates * args.qwen_questions * calls_per_pair
+        else:
+            calls_per_pair = (
+                2 * question_attempts * (2 + args.question_judge_repeats)
+                + args.pairwise_judge_repeats + 1
+            )
             estimated_calls = args.qwen_candidates * args.qwen_questions * calls_per_pair
         print(f"Estimated planned API calls (excluding network/format retries): {estimated_calls}")
         if not args.confirm_api_calls:
@@ -3589,9 +4295,15 @@ def main() -> None:
         if args.mode == "qwen":
             result = run_qwen(strategies=args.strategies, **common)
             print_compact("Qwen pilot complete", result)
-        else:
+        elif args.mode == "prompt_ablation":
             result = run_prompt_ablation(**common)
             print_compact("Fixed-target prompt ablation complete", result)
+        else:
+            result = run_prompt_ablation_v2(
+                pairwise_judge_repeats=args.pairwise_judge_repeats,
+                **common,
+            )
+            print_compact("V2 fixed-target prompt ablation complete", result)
 
 
 if __name__ == "__main__":
