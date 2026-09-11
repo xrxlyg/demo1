@@ -27,7 +27,66 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
         type(self).calls.append(payload)
         system = payload["messages"][0]["content"]
 
-        if "V2.4共享技术场景规划器" in system:
+        if "V2.5共享技术契约规划器" in system:
+            content = json.dumps({
+                "core_concept": "API向后兼容",
+                "scenario_text": (
+                    "现有客户端忽略响应中的未知可选字段，本次变更只新增一个可选字段"
+                ),
+                "stable_facts": [
+                    "现有客户端忽略未知可选字段",
+                    "本次只新增一个可选响应字段",
+                    "原有字段语义保持不变",
+                    "旧客户端无需升级",
+                    "响应仍使用原有媒体类型",
+                ],
+                "answerable_scope": "可判断旧客户端对新增字段的解析行为",
+                "assumptions_to_avoid": ["不假设客户端自动升级"],
+                "supported_conclusion": "旧客户端忽略新增字段并继续解析原有字段",
+                "decisive_evidence": "旧客户端对未知可选字段的处理行为",
+                "unsupported_claims": ["不能据此断言所有API变更都兼容"],
+            }, ensure_ascii=False)
+        elif "V2.5原子诊断探针规划器" in system:
+            probe_input = payload["messages"][1]["content"]
+            is_tree = "较低状态：" in probe_input
+            content = json.dumps({
+                "operation": (
+                    "predict_outcome" if is_tree else "choose_under_constraint"
+                ),
+                "single_task": (
+                    "请推演旧客户端的解析结果、说明原因和回滚方法？"
+                    if is_tree else "应选择什么兼容方案并说明理由？"
+                ),
+                "answer_outline": "旧客户端忽略新增字段并读取原有字段",
+                "required_fact_indices": [1, 2, 9],
+                "evidence_target": (
+                    "客户端解析行为的因果推演" if is_tree else "兼容方案选择"
+                ),
+                "answerability_check": "仅依赖共享事实",
+                "atomicity_check": "草案围绕兼容性",
+                "claim_check": "未引入额外事实",
+            }, ensure_ascii=False)
+        elif "V2.5技术有效性编辑器" in system:
+            validation_input = payload["messages"][1]["content"]
+            is_tree = "客户端解析行为的因果推演" in validation_input
+            content = json.dumps({
+                "operation": (
+                    "predict_outcome" if is_tree else "identify_decisive_mechanism"
+                ),
+                "single_task": (
+                    "旧客户端收到该响应后会出现什么解析结果？"
+                    if is_tree else "哪项机制保证旧客户端仍可解析响应？"
+                ),
+                "answer_outline": "旧客户端忽略新增字段并读取原有字段",
+                "required_fact_indices": [1, 2],
+                "evidence_target": (
+                    "客户端解析行为的因果推演" if is_tree else "识别兼容机制"
+                ),
+                "answerability_check": "答案仅使用共享事实",
+                "atomicity_check": "只有一个可评分结论",
+                "claim_check": "结论位于共享答案边界内",
+            }, ensure_ascii=False)
+        elif "V2.4共享技术场景规划器" in system:
             content = json.dumps({
                 "core_concept": "API向后兼容",
                 "scenario_text": (
@@ -480,6 +539,92 @@ class QwenPipelineTest(unittest.TestCase):
                 self.assertIn(
                     "prompt_tree_v24_vs_prompt_plain_v24",
                     analysis_report["paired_comparisons"],
+                )
+
+                calls_after_first = len(FakeDashScopeHandler.calls)
+                second = subprocess.run(
+                    command, cwd=ROOT, env=environment, text=True,
+                    capture_output=True, check=True,
+                )
+                self.assertEqual(len(FakeDashScopeHandler.calls), calls_after_first)
+                self.assertIn("3/3", second.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_v25_contract_validation_and_resume(self):
+        FakeDashScopeHandler.calls = []
+        FakeDashScopeHandler.generated_questions = 0
+        FakeDashScopeHandler.invalid_question_judge_once = False
+        FakeDashScopeHandler.invalid_answer_judge_once = False
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeDashScopeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                command = [
+                    sys.executable,
+                    str(ROOT / "experiment_all_in_one.py"),
+                    "--mode", "prompt_ablation_v25",
+                    "--base-url", f"http://127.0.0.1:{server.server_port}/v1",
+                    "--qwen-candidates", "3",
+                    "--qwen-questions", "1",
+                    "--question-judge-repeats", "1",
+                    "--pairwise-judge-repeats", "1",
+                    "--diagnostic-discrimination-repeats", "1",
+                    "--request-delay", "0",
+                    "--confirm-api-calls",
+                    "--output", output,
+                ]
+                environment = dict(os.environ, DASHSCOPE_API_KEY="test-only-key")
+                first = subprocess.run(
+                    command, cwd=ROOT, env=environment, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(first.returncode, 0, first.stderr)
+                experiment_dir = Path(output) / "exp10_prompt_ablation_v25"
+                pairs = [
+                    json.loads(line)
+                    for line in (experiment_dir / "pairs.jsonl").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+                self.assertEqual(len(pairs), 3)
+                self.assertEqual(len(FakeDashScopeHandler.calls), 39)
+                for pair in pairs:
+                    self.assertEqual(set(pair["variants"]), {
+                        "prompt_plain_v25", "prompt_tree_v25",
+                    })
+                    contract = pair["shared_factual_scaffold"]
+                    self.assertEqual(len(contract["stable_facts"]), 5)
+                    self.assertIn("supported_conclusion", contract)
+                    plain = pair["variants"]["prompt_plain_v25"][
+                        "question_generation_attempts"
+                    ][0]
+                    tree = pair["variants"]["prompt_tree_v25"][
+                        "question_generation_attempts"
+                    ][0]
+                    self.assertEqual(
+                        plain["shared_technical_contract"],
+                        tree["shared_technical_contract"],
+                    )
+                    self.assertNotEqual(plain["single_task"], tree["single_task"])
+                    self.assertIn("回滚方法", tree["draft_probe"]["single_task"])
+                    self.assertNotIn("回滚方法", tree["single_task"])
+                    self.assertEqual(tree["single_task"].count("？"), 1)
+                    self.assertIn("validation_model_raw_output", tree)
+                    self.assertTrue(
+                        pair["pairwise_evaluation"]["strict_technical_gate"]
+                    )
+                self.assertIn("Blind Tree preference", first.stdout)
+                self.assertNotIn('"question_model"', first.stdout)
+                report = json.loads(
+                    (experiment_dir / "quality_analysis" /
+                     "question_quality_summary.json").read_text(encoding="utf-8")
+                )
+                self.assertIn(
+                    "prompt_tree_v25_vs_prompt_plain_v25",
+                    report["paired_comparisons"],
                 )
 
                 calls_after_first = len(FakeDashScopeHandler.calls)
