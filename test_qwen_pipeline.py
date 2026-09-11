@@ -27,7 +27,18 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
         type(self).calls.append(payload)
         system = payload["messages"][0]["content"]
 
-        if "问题生成器" in system:
+        if "技术面试问题规划器" in system:
+            content = json.dumps({
+                "core_concept": "幂等处理",
+                "stable_facts": ["消息可能被重复投递"],
+                "expected_answer_points": ["使用幂等键避免重复副作用"],
+                "single_decision": "判断消费者应如何避免重复副作用",
+                "correct_answer_outline": "重复投递需要按业务键去重",
+                "assumptions_to_avoid": ["不假设中间件恰好一次投递"],
+                "diagnostic_probe": "能否识别业务幂等边界",
+                "history_link": "无",
+            }, ensure_ascii=False)
+        elif "问题生成器" in system:
             type(self).generated_questions += 1
             if type(self).generated_questions % 2:
                 content = "请简单谈谈这个技术。"
@@ -54,6 +65,25 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
                 }, ensure_ascii=False)
         elif "模拟技术面试候选人" in system:
             content = "我会先说明核心机制，再讨论生产环境中的性能、可靠性和故障恢复权衡。"
+        elif "受控的模拟候选人回答" in system:
+            content = json.dumps({
+                "lower_answer": "我认为收到消息后直接处理即可。",
+                "upper_answer": "我会使用业务幂等键记录处理结果，重复消息不再产生副作用。",
+            }, ensure_ascii=False)
+        elif "盲评诊断区分度评审器" in system:
+            content = json.dumps({
+                "answer_a_state": "H0",
+                "answer_b_state": "H1",
+                "question_diagnosticity": 8,
+                "confidence": 4,
+                "reason": "回答呈现了明确的幂等边界差异",
+            }, ensure_ascii=False)
+        elif "盲评技术面试问题比较器" in system:
+            content = json.dumps({
+                "winner": "A",
+                "confidence": 4,
+                "reason": "A更具诊断性",
+            }, ensure_ascii=False)
         elif "技术面试评分器" in system:
             if type(self).invalid_answer_judge_once:
                 type(self).invalid_answer_judge_once = False
@@ -156,6 +186,67 @@ class QwenPipelineTest(unittest.TestCase):
                 self.assertEqual(report["overall"]["quality_gate_enabled_rate"], 0.0)
                 self.assertEqual(report["overall"]["below_threshold_rate"], 0.5)
                 self.assertIn("Question quality by strategy", analysis.stdout)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_v22_key_metrics_and_resume(self):
+        FakeDashScopeHandler.calls = []
+        FakeDashScopeHandler.generated_questions = 0
+        FakeDashScopeHandler.invalid_question_judge_once = False
+        FakeDashScopeHandler.invalid_answer_judge_once = False
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeDashScopeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                command = [
+                    sys.executable,
+                    str(ROOT / "experiment_all_in_one.py"),
+                    "--mode", "prompt_ablation_v22",
+                    "--base-url", f"http://127.0.0.1:{server.server_port}/v1",
+                    "--qwen-candidates", "3",
+                    "--qwen-questions", "1",
+                    "--question-judge-repeats", "1",
+                    "--pairwise-judge-repeats", "1",
+                    "--diagnostic-discrimination-repeats", "1",
+                    "--request-delay", "0",
+                    "--confirm-api-calls",
+                    "--output", output,
+                ]
+                environment = dict(os.environ, DASHSCOPE_API_KEY="test-only-key")
+                first = subprocess.run(
+                    command, cwd=ROOT, env=environment, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(first.returncode, 0, first.stderr)
+                experiment_dir = Path(output) / "exp7_prompt_ablation_v22"
+                pairs = [
+                    json.loads(line)
+                    for line in (experiment_dir / "pairs.jsonl").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+                self.assertEqual(len(pairs), 3)
+                self.assertEqual(set(pairs[0]["variants"]), {
+                    "prompt_plain_v22", "prompt_tree_v22",
+                })
+                self.assertEqual(len(FakeDashScopeHandler.calls), 36)
+                self.assertIn("Blind Tree preference", first.stdout)
+                self.assertNotIn('"question_model"', first.stdout)
+                key_metrics = json.loads(
+                    (experiment_dir / "key_metrics.json").read_text(encoding="utf-8")
+                )
+                self.assertTrue(key_metrics["available"])
+                self.assertIn("technical_correctness", key_metrics)
+
+                calls_after_first = len(FakeDashScopeHandler.calls)
+                second = subprocess.run(
+                    command, cwd=ROOT, env=environment, text=True,
+                    capture_output=True, check=True,
+                )
+                self.assertEqual(len(FakeDashScopeHandler.calls), calls_after_first)
+                self.assertIn("3/3", second.stderr)
         finally:
             server.shutdown()
             server.server_close()
