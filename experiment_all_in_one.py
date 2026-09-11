@@ -24,6 +24,8 @@ Included:
      probes.  Tree may adapt the task to H0/H1, but neither arm may alter facts.
  11. V2.5 shared technical answer boundaries and a budget-matched atomicity and
      validity edit that prevents diagnostic probes from becoming multi-part.
+ 12. V2.6 visible evidence contracts, exact-skill history isolation, and an
+     explicit diagnostic anchor that survives the shared validity edit.
 
 Examples:
   python experiment_all_in_one.py --mode exp1 --output runs
@@ -53,6 +55,10 @@ Examples:
       --qwen-candidates 3 --qwen-questions 3 --pairwise-judge-repeats 3 \
       --diagnostic-discrimination-repeats 1 \
       --confirm-api-calls --output runs_v25
+  python experiment_all_in_one.py --mode prompt_ablation_v26 \
+      --qwen-candidates 3 --qwen-questions 3 --pairwise-judge-repeats 3 \
+      --diagnostic-discrimination-repeats 1 \
+      --confirm-api-calls --output runs_v26
   python experiment_all_in_one.py --mode all  --seeds 20 --output runs
   python experiment_all_in_one.py --mode analyze --output runs
 
@@ -4089,6 +4095,383 @@ def generate_v25_contract_question(
     )
 
 
+# V2.5 fixed the average technical-correctness delta, but its development
+# records exposed three implementation leaks: some stable facts never appeared
+# in the displayed question, full-history text could pull a new skill back to
+# the preceding scenario, and the neutral validity edit could erase the Tree
+# probe's discriminating feature.  V2.6 keeps every V2.5 result independently
+# resumable and fixes those mechanisms without filtering generated questions.
+V26_EXTRA_MULTI_TASK_MARKERS = (
+    "并解释", "并验证", "并论证", "并分析", "并比较", "并判断",
+    "同时验证", "同时分析", "同时判断", "原因和", "原因及",
+)
+V26_UNCERTAIN_CONCLUSION_MARKERS = (
+    "可能", "疑似", "尚不能确定", "无法确定", "需要验证", "需验证",
+)
+V26_OVERCLAIM_TASK_MARKERS = (
+    "根本原因", "具体原因", "直接导致", "唯一原因", "必然导致",
+)
+
+
+def parse_v26_scaffold_json(raw: str) -> Dict[str, object]:
+    data = _json_object_from_text(raw, "V2.6 visible evidence contract")
+    base = parse_v25_scaffold_json(raw)
+    if len(base["stable_facts"]) < 2:
+        raise ValueError("V2.6 scaffold requires at least two visible facts")
+    boundary = str(data.get("diagnostic_boundary", "")).strip()[:600]
+    surface_cue = str(data.get("surface_cue", "")).strip()[:500]
+    repaired = bool(base.get("technical_contract_repaired", False))
+    if not boundary:
+        boundary = str(base["supported_conclusion"])
+        repaired = True
+    if not surface_cue:
+        surface_cue = "题面中的表面现象不足以替代决定性证据"
+        repaired = True
+    try:
+        decisive_index = int(data.get("decisive_fact_index", 0))
+    except (TypeError, ValueError):
+        decisive_index = 0
+    if not 1 <= decisive_index <= len(base["stable_facts"]):
+        decisive_index = 1
+        repaired = True
+    base.update({
+        "diagnostic_boundary": boundary,
+        "surface_cue": surface_cue,
+        "decisive_fact_index": decisive_index,
+        "technical_contract_repaired": repaired,
+    })
+    return base
+
+
+def v26_scaffold_payload(scaffold: Mapping) -> Dict[str, object]:
+    payload = v25_scaffold_payload(scaffold)
+    payload.update({
+        "diagnostic_boundary": scaffold["diagnostic_boundary"],
+        "surface_cue": scaffold["surface_cue"],
+        "decisive_fact_index": scaffold["decisive_fact_index"],
+    })
+    return payload
+
+
+def render_v26_visible_scenario(scaffold: Mapping) -> str:
+    """Render every answer-bearing fact; metadata alone is never evidence."""
+    scenario = str(scaffold["scenario_text"]).strip().rstrip("。；; ")
+    extra_facts = [
+        str(fact).strip().rstrip("。；; ")
+        for fact in scaffold["stable_facts"]
+        if str(fact).strip() and str(fact).strip() not in scenario
+    ]
+    if extra_facts:
+        scenario += "。已知事实：" + "；".join(extra_facts)
+    return scenario.rstrip("。；; ")
+
+
+def normalized_probe_task(task: str) -> str:
+    return "".join(character.lower() for character in task if character.isalnum())
+
+
+def build_v26_shared_scaffold(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    exact_skill_history: Sequence[Mapping],
+) -> Dict[str, object]:
+    """Plan one self-contained, skill-specific, visibly answerable scenario."""
+    system = (
+        "你是V2.6共享可见证据契约规划器。只规划Plain和Tree共同使用的场景与技术"
+        "答案边界，不写最终问题。只输出严格JSON，不得输出Markdown。字段必须为"
+        "core_concept、scenario_text、stable_facts、answerable_scope、"
+        "assumptions_to_avoid、supported_conclusion、decisive_evidence、"
+        "unsupported_claims、diagnostic_boundary、surface_cue、"
+        "decisive_fact_index。场景必须直接考查目标叶子技能，不能借用其他技能的历史"
+        "场景。stable_facts中的每项都会由程序显示给候选人，因此必须自洽且不得包含"
+        "答案指令。supported_conclusion只能有一个主要结论；若事实不能确定根因，"
+        "结论只能是下一项决定性验证，不能写成确定根因。diagnostic_boundary说明一项"
+        "能够区分表面概念回答与证据推理的边界；surface_cue是容易误判但不能单独支持"
+        "结论的表面线索；decisive_fact_index指向真正支持结论的一项stable_fact。"
+        + V24_SHARED_FACT_GUARD
+    )
+    difficulty_guidance = {
+        "easy": "一个常见机制或边界，只需一个证据支持的判断",
+        "medium": "一次具体推演、故障定位或约束下选择，只评分一个结论",
+        "hard": "一次深入边界推演，但仍只评分一个结论",
+    }[difficulty]
+    prior_same_skill = [
+        {
+            "question": str(row.get("question", ""))[:260],
+            "answer": str(row.get("answer", ""))[:320],
+        }
+        for row in exact_skill_history[-3:]
+    ]
+    user = (
+        f"目标叶子技能：{skill}\n目标难度：{difficulty}（{difficulty_guidance}）\n"
+        f"能力路径：{' → '.join(SKILL_PATHS[skill])}\n"
+        f"目标技能诊断行为：{BRANCH_DIAGNOSTIC_LENSES[SKILL_TO_BRANCH[skill]]}\n"
+        f"仅同一叶子技能历史：{json.dumps(prior_same_skill, ensure_ascii=False)}\n"
+        "禁止复用其他技能的接口、字段、故障或团队背景。scenario_text只写必要背景；"
+        "stable_facts写2到6项候选人可见事实，并包含决定性证据。不得把‘可能’结论包装"
+        "成‘根本原因/具体原因/直接导致’。若目标技能是团队或交付实践，场景和结论必须"
+        "评价交付、协作、迭代或工程流程证据，不能退化为纯API或运行时故障题。"
+    )
+    return request_judge_json(
+        client, model, system, user, parse_v26_scaffold_json,
+        max_tokens=1150, temperature=0.12,
+    )
+
+
+def parse_v26_probe_json(
+    raw: str,
+    fact_count: int,
+    require_diagnostic_anchor: bool,
+    scaffold: Mapping,
+) -> Dict[str, object]:
+    data = _json_object_from_text(raw, "V2.6 anchored atomic probe")
+    probe = parse_v25_probe_json(raw, fact_count)
+    task = str(probe["single_task"])
+    if any(marker in task for marker in V26_EXTRA_MULTI_TASK_MARKERS):
+        raise ValueError("V2.6 single_task contains multiple scored actions")
+    supported = str(scaffold["supported_conclusion"])
+    if (
+        any(marker in supported for marker in V26_UNCERTAIN_CONCLUSION_MARKERS)
+        and any(marker in task for marker in V26_OVERCLAIM_TASK_MARKERS)
+    ):
+        raise ValueError("V2.6 task overclaims a probabilistic answer boundary")
+
+    anchor = " ".join(str(data.get("diagnostic_anchor", "")).strip().split())[:100]
+    criterion = str(data.get("single_scoring_criterion", "")).strip()[:600]
+    skill_check = str(data.get("skill_alignment_check", "")).strip()[:500]
+    visible_check = str(data.get("visible_evidence_check", "")).strip()[:500]
+    if require_diagnostic_anchor:
+        if not anchor:
+            raise ValueError("V2.6 Tree probe requires one diagnostic_anchor")
+        if not 2 <= len(anchor) <= 60:
+            raise ValueError("V2.6 diagnostic_anchor must be compact")
+        if anchor not in task:
+            raise ValueError("V2.6 diagnostic_anchor must appear verbatim in single_task")
+    elif anchor and anchor not in task:
+        raise ValueError("V2.6 optional diagnostic_anchor must appear in single_task")
+    if not criterion or not skill_check or not visible_check:
+        raise ValueError("V2.6 probe audit fields cannot be empty")
+    probe.update({
+        "diagnostic_anchor": anchor,
+        "single_scoring_criterion": criterion,
+        "skill_alignment_check": skill_check,
+        "visible_evidence_check": visible_check,
+    })
+    return probe
+
+
+def draft_v26_probe(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+    rejected_attempts: Sequence[Mapping],
+) -> Dict[str, object]:
+    is_tree = question_context["prompt_variant"] == "tree_v26"
+    system = (
+        "你是V2.6证据锚定原子探针规划器。共享可见场景由程序逐字放在问题前面，你只"
+        "规划紧随其后的一个任务。只输出严格JSON：operation、single_task、"
+        "answer_outline、required_fact_indices、evidence_target、answerability_check、"
+        "atomicity_check、claim_check、diagnostic_anchor、single_scoring_criterion、"
+        "skill_alignment_check、visible_evidence_check。operation只能是predict_outcome、"
+        "trace_failure、choose_under_constraint、identify_decisive_mechanism之一。只能"
+        "评分一个结论；‘追踪并解释’‘判断并验证’‘原因和方案’均属于两个任务，禁止。"
+    )
+    if is_tree:
+        card = question_context["diagnostic_contrast_card"]
+        exact_history = question_context.get("exact_skill_history", [])
+        variant = (
+            "这是Tree探针。根据相邻状态选择一个可观察、可评分的诊断边界。必须生成一个"
+            "2到30个汉字的diagnostic_anchor，并将它逐字写入single_task；该锚点必须来自"
+            "diagnostic_boundary或决定性可见事实。任务应要求候选人依据该锚点完成一次"
+            "因果判断、约束选择或结果预测，不能只泛泛地问原因，也不能把答案写进问题。"
+            f"\n较低状态：{card['lower_hypothesis']}"
+            f"\n较高状态：{card['upper_hypothesis']}"
+            f"\n必须诱发的证据：{card['required_discriminating_evidence']}"
+            f"\n同叶子历史：{json.dumps(exact_history, ensure_ascii=False)}"
+        )
+    else:
+        variant = (
+            "这是Plain探针。不使用候选人后验或能力假设，围绕目标叶子技能设计一个代表性"
+            "普通面试任务。diagnostic_anchor可为空；任务仍需具体、可回答且只评分一个"
+            "结论。不得故意弱化问题。"
+        )
+    rejected = [
+        {
+            "question": str(row.get("question", ""))[:320],
+            "feedback": str(row.get("feedback", ""))[:600],
+        }
+        for row in rejected_attempts[-2:]
+    ]
+    return request_judge_json(
+        client, model, system,
+        (
+            f"目标技能：{skill}\n目标难度：{difficulty}\n"
+            f"共享可见技术契约：{json.dumps(v26_scaffold_payload(shared_scaffold), ensure_ascii=False)}\n"
+            f"{variant}\n"
+            "single_scoring_criterion必须描述唯一评分单元。skill_alignment_check明确说明为何"
+            "考查目标叶子技能。visible_evidence_check确认answer_outline只使用会显示在题面"
+            "的scenario_text和stable_facts。若结论含‘可能/需验证’，问题不得询问根本或"
+            "具体原因。"
+            f"显式重试反馈：{json.dumps(rejected, ensure_ascii=False)}"
+        ),
+        parser=lambda value: parse_v26_probe_json(
+            value, len(shared_scaffold["stable_facts"]), is_tree,
+            shared_scaffold,
+        ),
+        max_tokens=900, temperature=0.18,
+    )
+
+
+def validate_v26_probe(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+    draft: Mapping,
+) -> Dict[str, object]:
+    """Budget-matched edit that cannot erase the Tree evidence anchor."""
+    is_tree = question_context["prompt_variant"] == "tree_v26"
+    system = (
+        "你是V2.6技术有效性编辑器。你不比较两个问题。根据共享可见技术契约审查并"
+        "必要时重写一个探针。只输出与输入相同字段的严格JSON。最终single_task只能有"
+        "一个问号、一个动作和一个可独立评分的结论，不得列举全部原因，不得新增事实，"
+        "不得超过supported_conclusion。若supported_conclusion是概率判断，只能询问最"
+        "合理假设或下一项决定性验证，不能询问根本原因。Tree输入的diagnostic_anchor"
+        "必须逐字保留在single_task中；不得为了简化而把证据锚定任务改成泛泛提问。"
+    )
+    user = (
+        f"目标技能：{skill}\n目标难度：{difficulty}\n"
+        f"探针类型：{'证据锚定' if is_tree else '普通代表性'}\n"
+        f"共享可见技术契约：{json.dumps(v26_scaffold_payload(shared_scaffold), ensure_ascii=False)}\n"
+        f"可见题面：{render_v26_visible_scenario(shared_scaffold)}\n"
+        f"待审查探针：{json.dumps({key: draft[key] for key in ('operation', 'single_task', 'answer_outline', 'required_fact_indices', 'evidence_target', 'answerability_check', 'atomicity_check', 'claim_check', 'diagnostic_anchor', 'single_scoring_criterion', 'skill_alignment_check', 'visible_evidence_check')}, ensure_ascii=False)}\n"
+        "静默核对目标叶子技能、全部答案事实是否可见、结论强度、单评分单元以及锚点保留。"
+    )
+    return request_judge_json(
+        client, model, system, user,
+        parser=lambda value: parse_v26_probe_json(
+            value, len(shared_scaffold["stable_facts"]), is_tree,
+            shared_scaffold,
+        ),
+        max_tokens=900, temperature=0.03,
+    )
+
+
+def generate_v26_visible_contract_question(
+    client: QwenClient,
+    question_model: str,
+    question_judge_model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+    regenerate_low_quality: bool,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+) -> Tuple[str, Dict[str, float], int, List[Dict]]:
+    attempts = []
+    rejected = []
+    maximum_attempts = max_regenerations + 1 if regenerate_low_quality else 1
+    visible_scenario = render_v26_visible_scenario(shared_scaffold)
+    for attempt_index in range(maximum_attempts):
+        draft = draft_v26_probe(
+            client, question_model, skill, difficulty, question_context,
+            shared_scaffold, rejected,
+        )
+        final_probe = validate_v26_probe(
+            client, question_model, skill, difficulty, question_context,
+            shared_scaffold, draft,
+        )
+        question = f"{visible_scenario}。{final_probe['single_task']}"
+        quality_scores, judge_details = evaluate_qwen_question(
+            client, question_judge_model, skill, difficulty, question,
+            dialogue_history, judge_repeats, question_context,
+        )
+        passes_quality = (
+            quality_scores["overall_question_quality"] >= quality_threshold
+            and quality_scores["technical_correctness"] >= 7.0
+            and quality_scores["general_question_quality"] >= 7.0
+        )
+        attempts.append({
+            "attempt": attempt_index,
+            "shared_visible_technical_contract": v26_scaffold_payload(
+                shared_scaffold
+            ),
+            "visible_scenario": visible_scenario,
+            "shared_scaffold_model_raw_output": shared_scaffold.get("raw", ""),
+            "draft_probe": {
+                key: draft[key] for key in (
+                    "operation", "single_task", "answer_outline",
+                    "required_fact_indices", "evidence_target",
+                    "diagnostic_anchor", "single_scoring_criterion",
+                    "skill_alignment_check", "visible_evidence_check",
+                )
+            },
+            "draft_probe_model_raw_output": draft.get("raw", ""),
+            "draft_probe_format_retry_count": draft.get(
+                "format_retry_count", 0
+            ),
+            **{
+                key: final_probe[key] for key in (
+                    "operation", "single_task", "answer_outline",
+                    "required_fact_indices", "evidence_target",
+                    "answerability_check", "atomicity_check", "claim_check",
+                    "diagnostic_anchor", "single_scoring_criterion",
+                    "skill_alignment_check", "visible_evidence_check",
+                )
+            },
+            "required_fact_indices_repaired": final_probe[
+                "required_fact_indices_repaired"
+            ],
+            "invalid_required_fact_indices": final_probe[
+                "invalid_required_fact_indices"
+            ],
+            "validation_model_raw_output": final_probe.get("raw", ""),
+            "validation_format_retry_count": final_probe.get(
+                "format_retry_count", 0
+            ),
+            "question": question,
+            "question_model_raw_output": final_probe.get("raw", ""),
+            "quality_scores": quality_scores,
+            "question_judge_details": judge_details,
+            "generation_pipeline": (
+                "visible_contract_then_anchored_atomic_probe_then_anchor_preserving_edit"
+            ),
+            "technical_validity_guard": True,
+            "all_contract_facts_visible": all(
+                normalized_probe_task(str(fact))
+                in normalized_probe_task(question)
+                for fact in shared_scaffold["stable_facts"]
+            ),
+            "strategy_leakage_flags": v21_question_leakage_flags(question),
+            "explicit_retry_gate_passed": passes_quality,
+        })
+        if not regenerate_low_quality or passes_quality:
+            break
+        rejected.append({
+            "question": question,
+            "feedback": (
+                "; ".join(
+                    row["reason"] for row in judge_details if row["reason"]
+                )
+            )[:1000],
+        })
+    accepted = attempts[-1]
+    return (
+        accepted["question"], accepted["quality_scores"],
+        len(attempts) - 1, attempts,
+    )
+
+
 def parse_counterfactual_answers_json(raw: str) -> Dict[str, str]:
     data = _json_object_from_text(raw, "Counterfactual answer")
     lower = str(data["lower_answer"]).strip()
@@ -5438,6 +5821,12 @@ def run_prompt_ablation_v2(
                 )
                 model.update(skill, ability_score, observation_std=ability_std)
                 per_skill_count[skill] += 1
+                plain_final_attempt = generated[plain_variant][
+                    "question_generation_attempts"
+                ][-1]
+                tree_final_attempt = generated[tree_variant][
+                    "question_generation_attempts"
+                ][-1]
                 pair = {
                     "created_at": utc_now(),
                     "candidate_id": profile.candidate_id,
@@ -5455,6 +5844,14 @@ def run_prompt_ablation_v2(
                     "quality_gate_enabled": regenerate_low_quality,
                     "variants": generated,
                     "pairwise_evaluation": pairwise,
+                    "probe_task_exact_match": (
+                        normalized_probe_task(
+                            str(plain_final_attempt.get("single_task", ""))
+                        )
+                        == normalized_probe_task(
+                            str(tree_final_attempt.get("single_task", ""))
+                        )
+                    ),
                     "canonical_question": canonical_question,
                     "answer": answer,
                     "assigned_skill_theta": profile.skill_theta[skill],
@@ -5817,6 +6214,24 @@ def run_prompt_ablation_v21(
                 "quality_gate_enabled": regenerate_low_quality,
             }
             for variant in variants
+        },
+        "pair_diagnostics": {
+            "probe_task_exact_match_rate": quality_mean([
+                float(bool(pair.get("probe_task_exact_match")))
+                for pair in pairs
+            ]),
+            "all_contract_facts_visible_rate": (
+                quality_mean([
+                    float(bool(
+                        generated["question_generation_attempts"][-1].get(
+                            "all_contract_facts_visible", False
+                        )
+                    ))
+                    for pair in pairs
+                    for generated in pair["variants"].values()
+                ])
+                if is_v26 else None
+            ),
         },
     }
     atomic_json(output_dir / "summary.json", result)
@@ -6483,12 +6898,14 @@ def run_prompt_ablation_v24(
     method_version: str = "V2.4",
 ) -> Dict:
     """Run the shared-facts V2.4 family while preserving old V2.4 resumes."""
-    if method_version not in ("V2.4", "V2.5"):
+    if method_version not in ("V2.4", "V2.5", "V2.6"):
         raise ValueError(f"Unsupported shared-facts method: {method_version}")
     is_v25 = method_version == "V2.5"
-    version_slug = "v25" if is_v25 else "v24"
+    is_v26 = method_version == "V2.6"
+    version_slug = "v26" if is_v26 else "v25" if is_v25 else "v24"
     output_dir = output_root / (
-        "exp10_prompt_ablation_v25" if is_v25
+        "exp11_prompt_ablation_v26" if is_v26
+        else "exp10_prompt_ablation_v25" if is_v25
         else "exp9_prompt_ablation_v24"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -6501,7 +6918,7 @@ def run_prompt_ablation_v24(
     tree_variant = f"prompt_tree_{version_slug}"
     variants = (plain_variant, tree_variant)
     setup = {
-        "schema_version": 6 if is_v25 else 5,
+        "schema_version": 7 if is_v26 else 6 if is_v25 else 5,
         "method_version": method_version,
         "seed": seed,
         "question_model": question_model,
@@ -6518,6 +6935,9 @@ def run_prompt_ablation_v24(
         "questions": questions,
         "prompt_variants": list(variants),
         "generation_pipeline": (
+            "one exact-skill shared visible evidence contract then a budget-matched "
+            "variant-specific atomic probe and anchor-preserving validity edit per arm"
+            if is_v26 else
             "one shared qwen-turbo technical contract then a budget-matched "
             "variant-specific atomic probe and qwen-turbo validity edit per arm"
             if is_v25 else
@@ -6637,6 +7057,10 @@ def run_prompt_ablation_v24(
                     f"{version_slug}-c{profile.candidate_id:03d}-t{turn:03d}"
                 )
                 shared_scaffold = (
+                    build_v26_shared_scaffold(
+                        client, question_model, skill, difficulty, exact_history,
+                    )
+                    if is_v26 else
                     build_v25_shared_scaffold(
                         client, question_model, skill, difficulty, history,
                     )
@@ -6656,6 +7080,13 @@ def run_prompt_ablation_v24(
                         if variant == tree_variant else f"plain_{version_slug}"
                     )
                     question, scores, regeneration_count, attempts = (
+                        generate_v26_visible_contract_question(
+                            client, question_model, question_judge_model,
+                            skill, difficulty, history, question_judge_repeats,
+                            quality_threshold, max_regenerations,
+                            regenerate_low_quality, context, shared_scaffold,
+                        )
+                        if is_v26 else
                         generate_v25_contract_question(
                             client, question_model, question_judge_model,
                             skill, difficulty, history, question_judge_repeats,
@@ -6729,6 +7160,8 @@ def run_prompt_ablation_v24(
                     "quality_threshold": quality_threshold,
                     "quality_gate_enabled": regenerate_low_quality,
                     "shared_factual_scaffold": (
+                        v26_scaffold_payload(shared_scaffold)
+                        if is_v26 else
                         v25_scaffold_payload(shared_scaffold)
                         if is_v25 else v24_scaffold_payload(shared_scaffold)
                     ),
@@ -6828,6 +7261,11 @@ def run_prompt_ablation_v24(
 def run_prompt_ablation_v25(**kwargs) -> Dict:
     """V2.5 entry point; V2.4 remains independently resumable."""
     return run_prompt_ablation_v24(method_version="V2.5", **kwargs)
+
+
+def run_prompt_ablation_v26(**kwargs) -> Dict:
+    """V2.6 entry point; earlier shared-facts modes remain resumable."""
+    return run_prompt_ablation_v24(method_version="V2.6", **kwargs)
 
 
 # =============================================================================
@@ -7188,6 +7626,7 @@ def paired_question_quality_comparison(
                 ("prompt_tree_v23", "prompt_plain_v23"),
                 ("prompt_tree_v24", "prompt_plain_v24"),
                 ("prompt_tree_v25", "prompt_plain_v25"),
+                ("prompt_tree_v26", "prompt_plain_v26"),
             )
             else "Strategies select different skills and difficulties, so this paired "
                  "delta measures end-to-end sequence quality rather than generator "
@@ -7260,6 +7699,7 @@ def run_question_quality_analysis(
             ("prompt_tree_v23", "prompt_plain_v23"),
             ("prompt_tree_v24", "prompt_plain_v24"),
             ("prompt_tree_v25", "prompt_plain_v25"),
+            ("prompt_tree_v26", "prompt_plain_v26"),
         )
         if set(pair).issubset(available_strategies)
     ]
@@ -7380,6 +7820,7 @@ def prompt_key_metrics(result: Mapping) -> Dict[str, object]:
     discrimination = result.get("counterfactual_discrimination", {})
     reliability = result.get("judge_reliability", {}).get(tree_variant, {})
     audit = result.get("validity_audit", {}).get(tree_variant, {})
+    pair_diagnostics = result.get("pair_diagnostics", {})
 
     def delta(values: Mapping) -> Dict[str, float]:
         return {
@@ -7433,6 +7874,12 @@ def prompt_key_metrics(result: Mapping) -> Dict[str, object]:
             ),
             "general_quality_below_7_rate": audit.get(
                 "general_quality_below_7_rate"
+            ),
+            "probe_task_exact_match_rate": pair_diagnostics.get(
+                "probe_task_exact_match_rate"
+            ),
+            "all_contract_facts_visible_rate": pair_diagnostics.get(
+                "all_contract_facts_visible_rate"
             ),
         },
         "tree_judge_reliability": {
@@ -7539,11 +7986,18 @@ def print_prompt_key_metrics(title: str, result: Mapping) -> None:
         )
     audit = key["tree_validity_audit"]
     if audit["strategy_leakage_rate"] is not None:
+        extra = ""
+        if audit.get("all_contract_facts_visible_rate") is not None:
+            extra = (
+                f", facts-visible={audit['all_contract_facts_visible_rate'] * 100:.2f}%"
+                f", task-collapse={audit['probe_task_exact_match_rate'] * 100:.2f}%"
+            )
         print(
             "Tree validity: "
             f"leakage={audit['strategy_leakage_rate'] * 100:.2f}%, "
             f"technical<7={audit['technical_correctness_below_7_rate'] * 100:.2f}%, "
             f"general<7={audit['general_quality_below_7_rate'] * 100:.2f}%"
+            f"{extra}"
         )
     print("Stage: development only; do not treat this run as confirmatory evidence.")
 
@@ -7568,7 +8022,8 @@ def parse_args() -> argparse.Namespace:
             "synthetic_suite", "qwen", "prompt_ablation",
             "prompt_ablation_v2", "prompt_ablation_v21",
             "prompt_ablation_v22", "prompt_ablation_v23",
-            "prompt_ablation_v24", "prompt_ablation_v25", "analyze", "all",
+            "prompt_ablation_v24", "prompt_ablation_v25",
+            "prompt_ablation_v26", "analyze", "all",
         ],
         default="all",
     )
@@ -7623,13 +8078,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-judge-repeats", type=int, default=3)
     parser.add_argument(
         "--pairwise-judge-repeats", type=int, default=3,
-        help="Blind A/B judge repeats for prompt_ablation_v2/v21/v22/v23/v24/v25",
+        help="Blind A/B judge repeats for prompt_ablation_v2/v21/v22/v23/v24/v25/v26",
     )
     parser.add_argument(
         "--diagnostic-discrimination-repeats", type=int, default=1,
         help=(
             "Blind H0/H1 classification repeats per question for "
-            "prompt_ablation_v21/v22/v23/v24/v25; use 0 to disable"
+            "prompt_ablation_v21/v22/v23/v24/v25/v26; use 0 to disable"
         ),
     )
     parser.add_argument("--quality-threshold", type=float, default=7.0)
@@ -7757,7 +8212,7 @@ def main() -> None:
     if args.mode in (
         "qwen", "prompt_ablation", "prompt_ablation_v2",
         "prompt_ablation_v21", "prompt_ablation_v22", "prompt_ablation_v23",
-        "prompt_ablation_v24", "prompt_ablation_v25",
+        "prompt_ablation_v24", "prompt_ablation_v25", "prompt_ablation_v26",
     ):
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
@@ -7812,7 +8267,7 @@ def main() -> None:
                 + args.pairwise_judge_repeats + 1 + discrimination_calls
             )
             estimated_calls = args.qwen_candidates * args.qwen_questions * calls_per_pair
-        elif args.mode == "prompt_ablation_v25":
+        elif args.mode in ("prompt_ablation_v25", "prompt_ablation_v26"):
             discrimination_calls = (
                 2 * (1 + args.diagnostic_discrimination_repeats)
                 if args.diagnostic_discrimination_repeats > 0 else 0
@@ -7909,7 +8364,7 @@ def main() -> None:
                 "V2.4 shared-facts prompt ablation complete", result,
                 verbose=args.verbose_results,
             )
-        else:
+        elif args.mode == "prompt_ablation_v25":
             result = run_prompt_ablation_v25(
                 pairwise_judge_repeats=args.pairwise_judge_repeats,
                 diagnostic_discrimination_repeats=(
@@ -7919,6 +8374,18 @@ def main() -> None:
             )
             print_compact(
                 "V2.5 validity-edited prompt ablation complete", result,
+                verbose=args.verbose_results,
+            )
+        else:
+            result = run_prompt_ablation_v26(
+                pairwise_judge_repeats=args.pairwise_judge_repeats,
+                diagnostic_discrimination_repeats=(
+                    args.diagnostic_discrimination_repeats
+                ),
+                **common,
+            )
+            print_compact(
+                "V2.6 visible-evidence prompt ablation complete", result,
                 verbose=args.verbose_results,
             )
 
