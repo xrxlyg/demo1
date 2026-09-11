@@ -27,7 +27,44 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
         type(self).calls.append(payload)
         system = payload["messages"][0]["content"]
 
-        if "技术面试问题规划器" in system:
+        if "V2.3技术脚手架规划器" in system:
+            content = json.dumps({
+                "core_concept": "API向后兼容",
+                "stable_facts": [
+                    "现有客户端忽略响应中的未知可选字段",
+                    "本次变更只新增一个可选响应字段",
+                ],
+                "probe_options": [
+                    {
+                        "probe_id": "P1",
+                        "single_task": "判断此次变更是否向后兼容并说明原因",
+                        "answer_outline": "兼容，因为旧客户端会忽略新增可选字段",
+                        "required_fact_indices": [1, 2],
+                    },
+                    {
+                        "probe_id": "P2",
+                        "single_task": "指出保证此次变更兼容的决定性条件",
+                        "answer_outline": "决定性条件是旧客户端忽略未知可选字段",
+                        "required_fact_indices": [1, 2],
+                    },
+                ],
+                "assumptions_to_avoid": ["不假设客户端会自动升级"],
+            }, ensure_ascii=False)
+        elif "V2.3技术面试问题生成器" in system:
+            realization_input = payload["messages"][1]["content"]
+            is_tree = "H0：" in realization_input
+            content = json.dumps({
+                "probe_id": "P2" if is_tree else "P1",
+                "question": (
+                    "现有客户端会忽略响应中的未知可选字段，本次只新增一个可选响应字段。"
+                    + (
+                        "保证此次变更向后兼容的决定性条件是什么？"
+                        if is_tree else "此次变更是否向后兼容，为什么？"
+                    )
+                ),
+                "answerability_check": "问题明确给出了两个必需事实。",
+            }, ensure_ascii=False)
+        elif "技术面试问题规划器" in system:
             content = json.dumps({
                 "core_concept": "幂等处理",
                 "stable_facts": ["消息可能被重复投递"],
@@ -239,6 +276,71 @@ class QwenPipelineTest(unittest.TestCase):
                 )
                 self.assertTrue(key_metrics["available"])
                 self.assertIn("technical_correctness", key_metrics)
+
+                calls_after_first = len(FakeDashScopeHandler.calls)
+                second = subprocess.run(
+                    command, cwd=ROOT, env=environment, text=True,
+                    capture_output=True, check=True,
+                )
+                self.assertEqual(len(FakeDashScopeHandler.calls), calls_after_first)
+                self.assertIn("3/3", second.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_v23_shared_scaffold_and_resume(self):
+        FakeDashScopeHandler.calls = []
+        FakeDashScopeHandler.generated_questions = 0
+        FakeDashScopeHandler.invalid_question_judge_once = False
+        FakeDashScopeHandler.invalid_answer_judge_once = False
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeDashScopeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                command = [
+                    sys.executable,
+                    str(ROOT / "experiment_all_in_one.py"),
+                    "--mode", "prompt_ablation_v23",
+                    "--base-url", f"http://127.0.0.1:{server.server_port}/v1",
+                    "--qwen-candidates", "3",
+                    "--qwen-questions", "1",
+                    "--question-judge-repeats", "1",
+                    "--pairwise-judge-repeats", "1",
+                    "--diagnostic-discrimination-repeats", "1",
+                    "--request-delay", "0",
+                    "--confirm-api-calls",
+                    "--output", output,
+                ]
+                environment = dict(os.environ, DASHSCOPE_API_KEY="test-only-key")
+                first = subprocess.run(
+                    command, cwd=ROOT, env=environment, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertEqual(first.returncode, 0, first.stderr)
+                experiment_dir = Path(output) / "exp8_prompt_ablation_v23"
+                pairs = [
+                    json.loads(line)
+                    for line in (experiment_dir / "pairs.jsonl").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+                self.assertEqual(len(pairs), 3)
+                self.assertEqual(len(FakeDashScopeHandler.calls), 33)
+                for pair in pairs:
+                    self.assertEqual(set(pair["variants"]), {
+                        "prompt_plain_v23", "prompt_tree_v23",
+                    })
+                    shared = pair["shared_technical_scaffold"]
+                    for generated in pair["variants"].values():
+                        attempt = generated["question_generation_attempts"][0]
+                        self.assertEqual(attempt["shared_technical_scaffold"], shared)
+                        self.assertIn(attempt["selected_probe_id"], {"P1", "P2"})
+                    self.assertTrue(
+                        pair["pairwise_evaluation"]["strict_technical_gate"]
+                    )
+                self.assertIn("Blind Tree preference", first.stdout)
+                self.assertIn("Estimated planned API calls", first.stdout)
 
                 calls_after_first = len(FakeDashScopeHandler.calls)
                 second = subprocess.run(
