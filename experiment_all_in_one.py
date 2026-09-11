@@ -3411,42 +3411,75 @@ def parse_v24_scaffold_json(raw: str) -> Dict[str, object]:
     data = _json_object_from_text(raw, "V2.4 shared factual scenario")
     core_concept = str(data["core_concept"]).strip()[:400]
     scenario_text = str(data["scenario_text"]).strip()[:650]
-    facts = [
-        str(item).strip()[:300] for item in data["stable_facts"]
-        if str(item).strip()
-    ]
     answerable_scope = str(data["answerable_scope"]).strip()[:500]
-    assumptions = [
-        str(item).strip()[:260] for item in data["assumptions_to_avoid"]
-        if str(item).strip()
-    ]
     if not core_concept or not scenario_text or not answerable_scope:
         raise ValueError("V2.4 scaffold text fields cannot be empty")
-    if not 1 <= len(facts) <= 4:
-        raise ValueError("V2.4 scaffold requires 1-4 stable_facts")
-    if not assumptions:
-        raise ValueError("V2.4 scaffold requires assumptions_to_avoid")
     if "?" in scenario_text or "？" in scenario_text:
         raise ValueError("V2.4 scenario_text must contain facts, not a question")
     if v21_question_leakage_flags(scenario_text):
         raise ValueError("V2.4 scenario_text leaks strategy information")
+
+    raw_facts = data.get("stable_facts", [])
+    if isinstance(raw_facts, list):
+        all_facts = [
+            str(item).strip()[:300] for item in raw_facts
+            if str(item).strip()
+        ]
+    elif str(raw_facts).strip():
+        all_facts = [str(raw_facts).strip()[:300]]
+    else:
+        all_facts = []
+    reported_fact_count = len(all_facts)
+    facts_repaired = not all_facts or not isinstance(raw_facts, list)
+    if not all_facts:
+        # stable_facts is structured audit metadata; scenario_text remains the
+        # authoritative shared question prefix and is already non-empty.
+        all_facts = [scenario_text]
+    facts = all_facts[:8]
+    dropped_fact_count = max(0, len(all_facts) - len(facts))
+
+    raw_assumptions = data.get("assumptions_to_avoid", [])
+    assumptions = (
+        [
+            str(item).strip()[:260] for item in raw_assumptions
+            if str(item).strip()
+        ]
+        if isinstance(raw_assumptions, list) else []
+    )
+    assumptions_repaired = not assumptions
+    if not assumptions:
+        assumptions = ["不得使用题面之外的未说明假设"]
     return {
         "core_concept": core_concept,
         "scenario_text": scenario_text.rstrip("。！？?"),
         "stable_facts": facts,
+        "reported_stable_fact_count": reported_fact_count,
+        "stable_facts_repaired": facts_repaired or dropped_fact_count > 0,
+        "dropped_stable_fact_count": dropped_fact_count,
         "answerable_scope": answerable_scope,
         "assumptions_to_avoid": assumptions[:4],
+        "assumptions_repaired": assumptions_repaired,
     }
 
 
 def v24_scaffold_payload(scaffold: Mapping) -> Dict[str, object]:
-    return {
+    payload = {
         key: scaffold[key]
         for key in (
             "core_concept", "scenario_text", "stable_facts",
             "answerable_scope", "assumptions_to_avoid",
         )
     }
+    payload.update({
+        key: scaffold.get(key, default)
+        for key, default in (
+            ("reported_stable_fact_count", len(scaffold["stable_facts"])),
+            ("stable_facts_repaired", False),
+            ("dropped_stable_fact_count", 0),
+            ("assumptions_repaired", False),
+        )
+    })
+    return payload
 
 
 def v24_exact_skill_history(
@@ -3488,7 +3521,8 @@ def build_v24_shared_scaffold(
         f"历史问题仅用于避免重复主题：{json.dumps(previous_questions, ensure_ascii=False)}\n"
         f"硬约束：{V24_SHARED_FACT_GUARD}\n"
         "scenario_text必须是一到两句可直接逐字放在两组最终题目前面的中性题面，完整"
-        "呈现stable_facts；不得提出问题。事实既要支持典型基础探针，也要支持基于因果"
+        "呈现stable_facts；不得提出问题。stable_facts建议1到6项，避免把同一事实拆成"
+        "过多条目。事实既要支持典型基础探针，也要支持基于因果"
         "机制、故障边界或核心权衡的单一探针。answerable_scope说明在这些事实下允许得出"
         "什么结论以及哪些结论仍不能唯一确定。"
     )

@@ -32,11 +32,14 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
                 "core_concept": "API向后兼容",
                 "scenario_text": (
                     "现有客户端会忽略响应中的未知可选字段，本次变更只新增一个可选"
-                    "响应字段"
+                    "响应字段；API使用HTTP并保留v1路径，旧客户端无需升级"
                 ),
                 "stable_facts": [
                     "现有客户端忽略响应中的未知可选字段",
                     "本次变更只新增一个可选响应字段",
+                    "API使用HTTP协议",
+                    "API继续保留v1路径",
+                    "旧客户端无需升级",
                 ],
                 "answerable_scope": "可判断旧客户端解析行为及此次响应变更的兼容性",
                 "assumptions_to_avoid": ["不假设客户端会自动升级"],
@@ -427,6 +430,12 @@ class QwenPipelineTest(unittest.TestCase):
                         "prompt_plain_v24", "prompt_tree_v24",
                     })
                     scenario = pair["shared_factual_scaffold"]["scenario_text"]
+                    self.assertEqual(
+                        len(pair["shared_factual_scaffold"]["stable_facts"]), 5
+                    )
+                    self.assertFalse(
+                        pair["shared_factual_scaffold"]["stable_facts_repaired"]
+                    )
                     plain_attempt = pair["variants"]["prompt_plain_v24"][
                         "question_generation_attempts"
                     ][0]
