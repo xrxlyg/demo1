@@ -4256,19 +4256,23 @@ def parse_v26_probe_json(
     ):
         raise ValueError("V2.6 task overclaims a probabilistic answer boundary")
 
-    anchor = " ".join(str(data.get("diagnostic_anchor", "")).strip().split())[:100]
+    anchor = " ".join(str(data.get("diagnostic_anchor", "")).strip().split())[:300]
     criterion = str(data.get("single_scoring_criterion", "")).strip()[:600]
     skill_check = str(data.get("skill_alignment_check", "")).strip()[:500]
     visible_check = str(data.get("visible_evidence_check", "")).strip()[:500]
     if require_diagnostic_anchor:
         if not anchor:
             raise ValueError("V2.6 Tree probe requires one diagnostic_anchor")
-        if not 2 <= len(anchor) <= 60:
-            raise ValueError("V2.6 diagnostic_anchor must be compact")
-        if anchor not in task:
-            raise ValueError("V2.6 diagnostic_anchor must appear verbatim in single_task")
-    elif anchor and anchor not in task:
-        raise ValueError("V2.6 optional diagnostic_anchor must appear in single_task")
+        decisive_index = int(scaffold["decisive_fact_index"])
+        diagnostic_fact_index_repaired = (
+            decisive_index not in probe["required_fact_indices"]
+        )
+        if diagnostic_fact_index_repaired:
+            probe["required_fact_indices"] = sorted(set(
+                [*probe["required_fact_indices"], decisive_index]
+            ))
+    else:
+        diagnostic_fact_index_repaired = False
     if not criterion:
         criterion = "是否给出共享答案边界内的唯一主要结论"
     if not skill_check:
@@ -4277,6 +4281,8 @@ def parse_v26_probe_json(
         visible_check = "参考答案仅使用程序显示的共享事实"
     probe.update({
         "diagnostic_anchor": anchor,
+        "diagnostic_anchor_verbatim_in_task": bool(anchor and anchor in task),
+        "diagnostic_fact_index_repaired": diagnostic_fact_index_repaired,
         "single_scoring_criterion": criterion,
         "skill_alignment_check": skill_check,
         "visible_evidence_check": visible_check,
@@ -4307,8 +4313,9 @@ def draft_v26_probe(
         exact_history = question_context.get("exact_skill_history", [])
         variant = (
             "这是Tree探针。根据相邻状态选择一个可观察、可评分的诊断边界。必须生成一个"
-            "2到30个汉字的diagnostic_anchor，并将它逐字写入single_task；该锚点必须来自"
-            "diagnostic_boundary或决定性可见事实。任务应要求候选人依据该锚点完成一次"
+            "简洁的diagnostic_anchor；该锚点必须描述diagnostic_boundary或决定性可见"
+            "事实。single_task可以自然地概括该锚点，不要求逐字复制，但"
+            "required_fact_indices必须包含decisive_fact_index。任务应要求候选人完成一次"
             "因果判断、约束选择或结果预测，不能只泛泛地问原因，也不能把答案写进问题。"
             f"\n较低状态：{card['lower_hypothesis']}"
             f"\n较高状态：{card['upper_hypothesis']}"
@@ -4366,7 +4373,8 @@ def validate_v26_probe(
         "一个问号、一个动作和一个可独立评分的结论，不得列举全部原因，不得新增事实，"
         "不得超过supported_conclusion。若supported_conclusion是概率判断，只能询问最"
         "合理假设或下一项决定性验证，不能询问根本原因。Tree输入的diagnostic_anchor"
-        "必须逐字保留在single_task中；不得为了简化而把证据锚定任务改成泛泛提问。"
+        "语义必须保留，required_fact_indices必须包含decisive_fact_index；允许single_task"
+        "自然改写锚点，但不得为了简化而把证据锚定任务改成泛泛提问。"
     )
     user = (
         f"目标技能：{skill}\n目标难度：{difficulty}\n"
@@ -4453,6 +4461,12 @@ def generate_v26_visible_contract_question(
             },
             "required_fact_indices_repaired": final_probe[
                 "required_fact_indices_repaired"
+            ],
+            "diagnostic_anchor_verbatim_in_task": final_probe[
+                "diagnostic_anchor_verbatim_in_task"
+            ],
+            "diagnostic_fact_index_repaired": final_probe[
+                "diagnostic_fact_index_repaired"
             ],
             "invalid_required_fact_indices": final_probe[
                 "invalid_required_fact_indices"
