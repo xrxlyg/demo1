@@ -28,7 +28,27 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
         type(self).calls.append(payload)
         system = payload["messages"][0]["content"]
 
-        if "V2.6共享可见证据契约规划器" in system:
+        if "V2.7证据锚定原子探针规划器" in system or "V2.7技术有效性编辑器" in system:
+            prompt = payload["messages"][1]["content"]
+            tree = "较低状态：" in prompt or "探针类型：证据锚定" in prompt
+            probe = {
+                "operation": "predict_outcome",
+                "single_task": ("判断旧客户端能否正确解析并说明唯一依据？" if tree
+                                else "此次字段变更是否保持向后兼容？"),
+                "answer_outline": "忽略新增可选字段，仍能解析原字段。",
+                "required_fact_indices": [1],
+                "evidence_target": "旧字段语义未变且未知字段可忽略",
+                "diagnostic_anchor": "旧客户端忽略未知可选字段，而原有必填字段及其语义均未改变" if tree else "",
+                "single_scoring_criterion": "正确判断兼容性并给出支持证据",
+                "semantic_checks": {
+                    "answer_uses_visible_facts": True,
+                    "diagnostic_boundary_preserved": True,
+                    "single_scored_product": True,
+                    "reason": "唯一结论只依赖可见字段解析规则",
+                },
+            }
+            content = repr(probe) if tree else json.dumps(probe, ensure_ascii=False)
+        elif "V2.6共享可见证据契约规划器" in system:
             content = json.dumps({
                 "core_concept": "API向后兼容",
                 "scenario_text": "服务端在v1响应中新增一个可选字段",
@@ -252,7 +272,7 @@ class FakeDashScopeHandler(BaseHTTPRequestHandler):
             else:
                 judge_input = payload["messages"][1]["content"]
                 question = judge_input.split("候选问题：", 1)[1].split("\n此前对话：", 1)[0]
-                score = 4 if "简单谈谈" in question else 9
+                score = 4 if ("简单谈谈" in question or "判断旧客户端能否正确解析并说明唯一依据" in question) else 9
                 content = json.dumps({
                     "skill_relevance": score,
                     "technical_correctness": score,
@@ -794,6 +814,216 @@ class QwenPipelineTest(unittest.TestCase):
                 )
                 self.assertEqual(len(FakeDashScopeHandler.calls), calls_after_first)
                 self.assertIn("3/3", second.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class V27ValidationTest(unittest.TestCase):
+    def setUp(self):
+        import experiment_all_in_one as experiment
+        self.m = experiment
+        self.scaffold = {
+            "core_concept": "隐私控制",
+            "stable_facts": ["备份权限为所有用户可读", "备份未加密"],
+            "decisive_fact_index": 2,
+            "supported_conclusion": "权限设置和未加密使备份数据暴露",
+            "diagnostic_boundary": "从可见访问与加密证据识别隐私控制缺陷",
+        }
+        self.probe = {
+            "operation": "identify_decisive_mechanism",
+            "single_task": "识别数据暴露的控制缺陷并给出支持证据？",
+            "answer_outline": "所有用户可读且备份未加密，导致数据暴露。",
+            "required_fact_indices": [1],
+            "evidence_target": "权限与加密事实",
+            "diagnostic_anchor": "备份文件未加密且权限设置为所有用户可读；该证据描述允许自然概括，不能要求逐字抄写到问题中。" * 3,
+            "single_scoring_criterion": "正确识别并论证核心隐私控制缺陷",
+        }
+
+    def parse(self, probe=None, **kwargs):
+        return self.m.parse_v27_probe_json(
+            json.dumps(self.probe if probe is None else probe, ensure_ascii=False),
+            2, True, self.scaffold, **kwargs,
+        )
+
+    def test_standard_json_and_long_nonverbatim_anchor(self):
+        result = self.parse()
+        self.assertEqual(result["diagnostic_anchor"], self.probe["diagnostic_anchor"])
+        self.assertFalse(result["diagnostic_anchor_verbatim_in_task"])
+        self.assertEqual(result["single_task"], self.probe["single_task"])
+
+    def test_safe_python_literal_and_no_code_execution(self):
+        result = self.m.parse_v27_probe_json(repr(self.probe), 2, True, self.scaffold)
+        self.assertEqual(result["answer_outline"], self.probe["answer_outline"])
+        with self.assertRaises(self.m.JsonFormatError):
+            self.m.decode_probe_object("{'x': __import__('os').getcwd()}")
+
+    def test_missing_audit_index_repaired_without_call_or_question_change(self):
+        result = self.parse()
+        self.assertEqual(result["decisive_fact_index"], 2)
+        self.assertEqual(result["required_fact_indices"], [1, 2])
+        self.assertTrue(result["repaired"])
+        self.assertIn("decisive_fact_index_from_shared_contract", result["repair_log"])
+        self.assertEqual(result["single_task"], self.probe["single_task"])
+
+    def test_evidence_supported_single_products_accepted(self):
+        for task in ("判断结论并说明唯一依据？", "选择一个方案并说明核心权衡？",
+                     "识别机制并给出支持证据？", "识别并论证核心隐私控制缺陷？",
+                     "判断并说明依据？", "依据现有修复方案判断故障原因？"):
+            with self.subTest(task=task):
+                self.parse({**self.probe, "single_task": task})
+
+    def test_independent_products_rejected(self):
+        for task in ("设计算法并分析复杂度？", "诊断原因并给出修复方案？", "根因诊断 + 修复方案？",
+                     "选择版本并制定回滚计划？", "列出原因并给出排查步骤及验证点？",
+                     "分析故障传播并设计独立恢复策略？",
+                     "Give a root cause diagnosis and propose a remediation plan?"):
+            with self.subTest(task=task), self.assertRaisesRegex(self.m.ProbeValidationError, "两个可独立评分"):
+                self.parse({**self.probe, "single_task": task})
+
+    def test_claim_strength_and_semantic_editor_failures(self):
+        self.scaffold["supported_conclusion"] = "可能是权限设置问题，需验证"
+        with self.assertRaisesRegex(self.m.ProbeValidationError, "claim_strength"):
+            self.parse({**self.probe, "single_task": "根本原因是什么？"})
+        checks = {"answer_uses_visible_facts": True, "diagnostic_boundary_preserved": True,
+                  "single_scored_product": True, "reason": "reference answer invents an invisible log"}
+        for key in ("answer_uses_visible_facts", "diagnostic_boundary_preserved", "single_scored_product"):
+            with self.subTest(rule=key), self.assertRaisesRegex(self.m.ProbeValidationError, key):
+                self.parse({**self.probe, "semantic_checks": {**checks, key: False}}, require_semantic_checks=True)
+
+    def client(self, outputs):
+        class FakeClient:
+            def __init__(self):
+                self.outputs = iter(outputs)
+                self.users = []
+            def chat(self, model, system, user, **kwargs):
+                self.users.append(user)
+                return next(self.outputs)
+        return FakeClient()
+
+    def test_truncated_json_retries_with_specific_error(self):
+        raw = json.dumps(self.probe, ensure_ascii=False)
+        client = self.client([raw[:-25], raw])
+        result = self.m.request_judge_json(client, "fake", "system", "task",
+                     lambda raw: self.m.parse_v27_probe_json(raw, 2, True, self.scaffold))
+        self.assertEqual(result["format_retry_count"], 1)
+        self.assertEqual(result["invalid_raw_outputs"][0]["error_category"], "json_format")
+        self.assertIn("JsonFormatError", client.users[1])
+        self.assertIn("format_attempt=1", client.users[1])
+        self.assertIn("missing or truncated JSON object", client.users[1])
+
+    def test_semantic_retry_reason_and_raw_journal(self):
+        invalid = json.dumps({**self.probe, "single_task": "诊断原因并给出修复方案？"}, ensure_ascii=False)
+        client = self.client([invalid, json.dumps(self.probe, ensure_ascii=False)])
+        with tempfile.TemporaryDirectory() as directory:
+            client.json_audit_path = Path(directory) / "json_requests.jsonl"
+            result = self.m.request_judge_json(client, "fake", "system", "task",
+                         lambda raw: self.m.parse_v27_probe_json(raw, 2, True, self.scaffold))
+            records = [json.loads(line) for line in client.json_audit_path.read_text().splitlines()]
+        self.assertEqual(result["invalid_raw_outputs"][0]["error_category"], "semantic_validation")
+        self.assertIn("根因诊断 + 修复方案", client.users[1])
+        self.assertEqual(records[0]["raw"], invalid)
+        self.assertEqual(records[1]["status"], "accepted")
+
+    def test_terminal_error_retains_rule_attempt_and_full_output(self):
+        invalid = json.dumps({**self.probe, "single_task": "诊断原因并给出修复方案？"}, ensure_ascii=False)
+        client = self.client([invalid] * 3)
+        with self.assertRaises(self.m.JsonRequestError) as caught:
+            self.m.request_judge_json(client, "fake", "system", "task",
+                     lambda raw: self.m.parse_v27_probe_json(raw, 2, True, self.scaffold))
+        message = str(caught.exception)
+        for value in ("format_attempt=3/3", "semantic_validation", "ProbeValidationError", "修复方案", self.probe["diagnostic_anchor"]):
+            self.assertIn(value, message)
+        self.assertEqual(len(caught.exception.invalid_raw_outputs), 3)
+
+    def test_v26_parser_retains_original_strict_rules(self):
+        with self.assertRaises(ValueError):
+            self.m.parse_v26_probe_json(json.dumps(self.probe, ensure_ascii=False), 2, True, self.scaffold)
+
+    def test_v27_fake_api_3x3_budget_analysis_retention_and_resume(self):
+        FakeDashScopeHandler.calls = []
+        FakeDashScopeHandler.generated_questions = 0
+        FakeDashScopeHandler.invalid_question_judge_once = False
+        FakeDashScopeHandler.invalid_answer_judge_once = False
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeDashScopeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                command = [sys.executable, str(ROOT / "experiment_all_in_one.py"),
+                    "--mode", "prompt_ablation_v27", "--seed", "20260919",
+                    "--base-url", f"http://127.0.0.1:{server.server_port}/v1",
+                    "--qwen-candidates", "3", "--qwen-questions", "3",
+                    "--question-judge-repeats", "3", "--pairwise-judge-repeats", "3",
+                    "--diagnostic-discrimination-repeats", "1",
+                    "--request-delay", "0", "--confirm-api-calls", "--output", output]
+                env = dict(os.environ, DASHSCOPE_API_KEY="test-only-key")
+                first = subprocess.run(command, env=env, text=True, capture_output=True)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                self.assertEqual(len(FakeDashScopeHandler.calls), 171)
+                draft_calls = [call for call in FakeDashScopeHandler.calls
+                               if "V2.7证据锚定原子探针规划器" in call["messages"][0]["content"]]
+                self.assertEqual(len(draft_calls), 18)
+                for index in range(0, 18, 2):
+                    histories = [call["messages"][1]["content"].split("共享同叶子历史：", 1)[1].split("\n", 1)[0]
+                                 for call in draft_calls[index:index + 2]]
+                    self.assertEqual(histories[0], histories[1])
+                    self.assertTrue(all(call["model"] == "qwen-turbo" for call in draft_calls[index:index + 2]))
+                for call in FakeDashScopeHandler.calls:
+                    if "V2.7技术有效性编辑器" in call["messages"][0]["content"]:
+                        self.assertEqual(call["model"], "qwen-turbo")
+                directory = Path(output) / "exp12_prompt_ablation_v27"
+                original_pairs = (directory / "pairs.jsonl").read_bytes()
+                pairs = [json.loads(line) for line in original_pairs.splitlines()]
+                self.assertEqual(len(pairs), 9)
+                for pair in pairs:
+                    for variant, generated in pair["variants"].items():
+                        self.assertEqual(generated["regeneration_count"], 0)
+                        attempt = generated["question_generation_attempts"][0]
+                        self.assertTrue(attempt["all_contract_facts_visible"])
+                        self.assertEqual(len(generated["question_generation_attempts"]), 1)
+                        if "tree" in variant:
+                            audit = attempt["final_probe_audit"]
+                            self.assertFalse(audit["diagnostic_anchor_verbatim_in_task"])
+                            self.assertTrue(audit["diagnostic_fact_index_repaired"])
+                            self.assertIn(2, audit["required_fact_indices"])
+                        for fact in pair["shared_factual_scaffold"]["stable_facts"]:
+                            self.assertIn(fact, generated["question"])
+                summary = json.loads((directory / "summary.json").read_text())
+                # Deliberately poor Tree questions remain in all records and summaries.
+                self.assertEqual(summary["validity_audit"]["prompt_tree_v27"]["technical_correctness_below_7_rate"], 1)
+                self.assertLess(summary["paired_absolute_quality"]["metrics"]["technical_correctness"]["mean_delta"], 0)
+                self.assertEqual(summary["pair_diagnostics"]["all_contract_facts_visible_rate"], 1)
+                self.assertEqual(summary["pair_diagnostics"]["probe_task_exact_match_rate"], 0)
+                for text in ("Blind Tree preference", "facts-visible=100.00%", "task-collapse=0.00%", "171"):
+                    self.assertIn(text, first.stdout)
+                self.assertNotIn('"question_model"', first.stdout)
+                # A complete identical rerun makes no new calls or pair writes.
+                second = subprocess.run(command, env=env, text=True, capture_output=True)
+                self.assertEqual(second.returncode, 0, second.stderr)
+                self.assertEqual(len(FakeDashScopeHandler.calls), 171)
+                self.assertEqual((directory / "pairs.jsonl").read_bytes(), original_pairs)
+                self.assertIn("9/9", second.stderr)
+                # Analyze is also independent of API access.
+                analysis = subprocess.run([sys.executable, str(ROOT / "experiment_all_in_one.py"),
+                    "--mode", "analyze", "--analysis-input", str(directory / "turns.jsonl"),
+                    "--analysis-output", str(directory / "analysis_cli")],
+                    text=True, capture_output=True)
+                self.assertEqual(analysis.returncode, 0, analysis.stderr)
+                report = json.loads((directory / "analysis_cli" / "question_quality_summary.json").read_text())
+                self.assertIn("prompt_tree_v27_vs_prompt_plain_v27", report["paired_comparisons"])
+                verbose = subprocess.run(command + ["--verbose-results"], env=env, text=True, capture_output=True)
+                self.assertEqual(verbose.returncode, 0, verbose.stderr)
+                self.assertIn('"question_model"', verbose.stdout)
+                self.assertEqual(len(FakeDashScopeHandler.calls), 171)
+                # Simulate interruption after the first candidate's three complete pairs.
+                prefix = b"".join(original_pairs.splitlines(keepends=True)[:3])
+                (directory / "pairs.jsonl").write_bytes(prefix)
+                partial = subprocess.run(command, env=env, text=True, capture_output=True)
+                self.assertEqual(partial.returncode, 0, partial.stderr)
+                self.assertEqual(len(FakeDashScopeHandler.calls), 171 + 6 * 19)
+                self.assertTrue((directory / "pairs.jsonl").read_bytes().startswith(prefix))
+                self.assertEqual(len((directory / "pairs.jsonl").read_text().splitlines()), 9)
         finally:
             server.shutdown()
             server.server_close()

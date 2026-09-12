@@ -55,6 +55,12 @@ Examples:
       --qwen-candidates 3 --qwen-questions 3 --pairwise-judge-repeats 3 \
       --diagnostic-discrimination-repeats 1 \
       --confirm-api-calls --output runs_v25
+  python experiment_all_in_one.py --mode prompt_ablation_v27 \
+      --seed 20260919 --qwen-candidates 3 --qwen-questions 3 \
+      --question-judge-repeats 3 --pairwise-judge-repeats 3 \
+      --diagnostic-discrimination-repeats 1 \
+      --confirm-api-calls --output runs_v27
+
   python experiment_all_in_one.py --mode prompt_ablation_v26 \
       --qwen-candidates 3 --qwen-questions 3 --pairwise-judge-repeats 3 \
       --diagnostic-discrimination-repeats 1 \
@@ -85,6 +91,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -2336,6 +2343,39 @@ def parse_question_quality_json(raw: str) -> Dict:
     return parsed
 
 
+class JsonFormatError(ValueError):
+    """The response cannot be decoded as an object."""
+
+
+class ProbeValidationError(ValueError):
+    """A decoded object violates a named technical contract rule."""
+
+
+class JsonRequestError(ValueError):
+    def __init__(self, message, invalid_outputs):
+        super().__init__(message)
+        self.invalid_raw_outputs = invalid_outputs
+
+
+def decode_probe_object(raw: str) -> Dict:
+    """Accept strict JSON or a safe Python literal; never execute model text."""
+    cleaned = raw.strip().replace("```json", "").replace("```python", "").replace("```", "").strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start < 0 or end <= start:
+        raise JsonFormatError("missing or truncated JSON object")
+    candidate = cleaned[start:end + 1]
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError as json_error:
+        try:
+            data = ast.literal_eval(candidate)
+        except (ValueError, SyntaxError) as exc:
+            raise JsonFormatError(f"JSON decode failed: {json_error}; literal decode failed: {exc}") from exc
+    if not isinstance(data, dict):
+        raise JsonFormatError("response must be an object")
+    return data
+
+
 def request_judge_json(
     client: QwenClient,
     model: str,
@@ -2346,36 +2386,53 @@ def request_judge_json(
     max_tokens: int = 400,
     temperature: float = 0.2,
 ) -> Dict:
-    """Retry judge calls whose content is not valid JSON and retain bad outputs."""
+    """Report syntax and validator failures separately and retain every output."""
     invalid_outputs = []
     current_user = user
-    for format_attempt in range(max_format_attempts):
+    for format_attempt in range(1, max_format_attempts + 1):
         raw = client.chat(
             model, system, current_user,
             temperature=temperature, max_tokens=max_tokens,
         )
+        record = {"format_attempt": format_attempt, "model": model,
+                  "parser": getattr(parser, "__name__", type(parser).__name__),
+                  "raw": raw}
         try:
             parsed = parser(raw)
         except (ValueError, KeyError, TypeError) as exc:
-            invalid_outputs.append({
-                "raw": raw,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-            if format_attempt + 1 == max_format_attempts:
-                raise ValueError(
-                    f"Judge failed to return valid JSON after {max_format_attempts} attempts; "
-                    f"last output: {raw[:500]!r}"
+            category = "semantic_validation"
+            try:
+                decode_probe_object(raw)
+            except JsonFormatError:
+                category = "json_format"
+            if isinstance(exc, (JsonFormatError, json.JSONDecodeError)):
+                category = "json_format"
+            record.update({"error_category": category,
+                           "error_type": type(exc).__name__,
+                           "error": f"{type(exc).__name__}: {exc}"})
+            invalid_outputs.append(record)
+            if getattr(client, "json_audit_path", None):
+                append_jsonl(client.json_audit_path, {**record, "system": system})
+            if format_attempt == max_format_attempts:
+                raise JsonRequestError(
+                    f"JSON request failed: format_attempt={format_attempt}/{max_format_attempts}; "
+                    f"parser={record['parser']}; category={category}; "
+                    f"{record['error']}; last output: {raw!r}", invalid_outputs,
                 ) from exc
             current_user = (
-                f"{user}\n\n你上一次的输出无法解析：{raw[:1000]}\n"
-                "请重新完成任务。只输出严格JSON对象，不要Markdown代码块或任何额外文字。"
+                f"{user}\n\n上一次输出失败：format_attempt={format_attempt}; "
+                f"category={category}; {record['error']}\n"
+                f"上一次完整输出：{raw}\n"
+                "请针对上述具体错误修正。只输出严格JSON对象，不要Markdown或额外文字。"
             )
             continue
+        if getattr(client, "json_audit_path", None):
+            append_jsonl(client.json_audit_path, {**record, "system": system, "status": "accepted"})
         parsed["raw"] = raw
-        parsed["format_retry_count"] = format_attempt
+        parsed["format_retry_count"] = format_attempt - 1
         parsed["invalid_raw_outputs"] = invalid_outputs
         return parsed
-    raise RuntimeError("unreachable")
+    raise ValueError("max_format_attempts must be positive")
 
 
 def evaluate_qwen_question(
@@ -4439,6 +4496,358 @@ def generate_v26_visible_contract_question(
                 )
             },
             "draft_probe_model_raw_output": draft.get("raw", ""),
+            "draft_probe_format_retry_count": draft.get(
+                "format_retry_count", 0
+            ),
+            **{
+                key: final_probe[key] for key in (
+                    "operation", "single_task", "answer_outline",
+                    "required_fact_indices", "evidence_target",
+                    "answerability_check", "atomicity_check", "claim_check",
+                    "diagnostic_anchor", "single_scoring_criterion",
+                    "skill_alignment_check", "visible_evidence_check",
+                )
+            },
+            "required_fact_indices_repaired": final_probe[
+                "required_fact_indices_repaired"
+            ],
+            "invalid_required_fact_indices": final_probe[
+                "invalid_required_fact_indices"
+            ],
+            "validation_model_raw_output": final_probe.get("raw", ""),
+            "validation_format_retry_count": final_probe.get(
+                "format_retry_count", 0
+            ),
+            "question": question,
+            "question_model_raw_output": final_probe.get("raw", ""),
+            "quality_scores": quality_scores,
+            "question_judge_details": judge_details,
+            "generation_pipeline": (
+                "visible_contract_then_anchored_atomic_probe_then_anchor_preserving_edit"
+            ),
+            "technical_validity_guard": True,
+            "all_contract_facts_visible": all(
+                normalized_probe_task(str(fact))
+                in normalized_probe_task(question)
+                for fact in shared_scaffold["stable_facts"]
+            ),
+            "strategy_leakage_flags": v21_question_leakage_flags(question),
+            "explicit_retry_gate_passed": passes_quality,
+        })
+        if not regenerate_low_quality or passes_quality:
+            break
+        rejected.append({
+            "question": question,
+            "feedback": (
+                "; ".join(
+                    row["reason"] for row in judge_details if row["reason"]
+                )
+            )[:1000],
+        })
+    accepted = attempts[-1]
+    return (
+        accepted["question"], accepted["quality_scores"],
+        len(attempts) - 1, attempts,
+    )
+
+
+
+# V2.7: preserve V2.6 while replacing literal anchors and conjunction filters.
+V27_SINGLE_PRODUCT_GUIDANCE = (
+    "按独立可评分的技术产物判断单任务，而不是按连接词或动词个数。"
+    "判断并说明唯一依据、选择并说明核心权衡、识别机制并给出支持证据均为一个任务。"
+    "算法设计加复杂度分析、根因诊断加修复方案、版本选择加回滚计划、"
+    "原因列表加排查步骤加验证点、传播分析加独立恢复策略均为多任务，应拒绝。"
+    "required_fact_indices必须引用可见事实；Tree必须包含契约的decisive_fact_index。"
+)
+
+
+def v27_multiple_product_reason(task: str) -> str:
+    """Detect explicit independent products; semantic editor handles paraphrases.
+
+    A conjunction followed by justification is not a second technical product.
+    This conservative local check is not a general natural-language proof.
+    """
+    product_pairs = (
+        (r"算法|algorithm", r"复杂度|complexity", "算法设计 + 复杂度分析"),
+        (r"诊断|根因|原因|diagnos|root cause", r"修复方案|修复措施|解决方案|修复策略|fix|remediat", "根因诊断 + 修复方案"),
+        (r"版本|version", r"回滚计划|回滚方案|rollback plan", "版本选择 + 回滚计划"),
+        (r"原因|cause", r"排查步骤|验证点|排查流程|troubleshoot", "原因列表 + 排查步骤或验证点"),
+        (r"传播|propagat", r"恢复策略|恢复方案|recovery strateg", "故障传播分析 + 恢复策略设计"),
+    )
+    # Require a requested second deliverable, not mere mention of its concept.
+    separator = r"并|以及|同时|而且|还需|还要|及|和|与|加|[+＋；;]|\band\b"
+    clauses = re.split(separator, task, flags=re.I)
+    request = r"设计|分析|诊断|识别|判断|选择|给出|提出|制定|列出|说明|解释|推导|计算|describe|design|analy|diagnos|choose|provide|propose|list|explain|derive|calculate"
+    for first, second, label in product_pairs:
+        for i, left in enumerate(clauses):
+            for right in clauses[i + 1:]:
+                if (re.search(first, left, re.I) and re.search(second, right, re.I)
+                        or re.search(second, left, re.I) and re.search(first, right, re.I)):
+                    noun_product = r"\s*(?:修复方案|修复措施|解决方案|回滚计划|回滚方案|排查步骤|验证点|恢复策略|复杂度分析)[？?。.!！ ]*"
+                    if (re.search(request, left, re.I)
+                            and (re.search(request, right, re.I)
+                                 or re.fullmatch(noun_product, right))):
+                        return "单任务约束失败：存在两个可独立评分的技术产物：" + label
+    return ""
+
+
+def parse_v27_probe_json(
+    raw: str, fact_count: int, require_diagnostic_anchor: bool,
+    scaffold: Mapping, require_semantic_checks: bool = False,
+) -> Dict[str, object]:
+    data = decode_probe_object(raw)
+    def required_text(key):
+        value = data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ProbeValidationError(f"required_field: {key} must be nonempty text")
+        return " ".join(value.strip().split())
+
+    task = required_text("single_task")
+    if not task.count("?") + task.count("？"):
+        task = task.rstrip("。！") + "？"
+    if task.count("?") + task.count("？") != 1:
+        raise ProbeValidationError("single_product: exactly one main question required")
+    criterion = str(data.get("single_scoring_criterion", "")).strip()
+    for text in (task, criterion):
+        reason = v27_multiple_product_reason(text)
+        if reason:
+            raise ProbeValidationError(reason)
+    if v21_question_leakage_flags(task):
+        raise ProbeValidationError("strategy_leakage: task reveals experiment strategy")
+    supported = str(scaffold["supported_conclusion"])
+    if (any(m in supported for m in V26_UNCERTAIN_CONCLUSION_MARKERS)
+            and any(m in task for m in V26_OVERCLAIM_TASK_MARKERS)):
+        raise ProbeValidationError("claim_strength: 概率性证据不能支持确定根因；请询问合理假设或决定性验证")
+    operation = required_text("operation")
+    if operation not in V25_ATOMIC_OPERATIONS:
+        raise ProbeValidationError(f"operation: unsupported value {operation!r}")
+    anchor = str(data.get("diagnostic_anchor", "")).strip()
+    if require_diagnostic_anchor and not anchor:
+        raise ProbeValidationError("diagnostic_anchor: Tree requires an evidence description, paraphrases allowed")
+    decisive = scaffold.get("decisive_fact_index")
+    if isinstance(decisive, bool) or not isinstance(decisive, int) or not 1 <= decisive <= fact_count:
+        raise ProbeValidationError("contract: invalid decisive_fact_index")
+    repairs, invalid, indices = [], [], []
+    supplied = data.get("required_fact_indices", [])
+    if not isinstance(supplied, list):
+        invalid.append(supplied)
+        supplied = []
+    for value in supplied:
+        if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= fact_count:
+            indices.append(value)
+        elif isinstance(value, str) and value.isdigit() and 1 <= int(value) <= fact_count:
+            indices.append(int(value))
+            repairs.append("required_fact_index_string_to_integer")
+        else:
+            invalid.append(value)
+    if not indices:
+        indices = list(range(1, fact_count + 1))
+        repairs.append("required_fact_indices_missing_or_invalid")
+    if invalid:
+        repairs.append("invalid_required_fact_indices_removed")
+    if require_diagnostic_anchor and decisive not in indices:
+        indices.append(decisive)
+        repairs.append("decisive_fact_index_added_to_required_facts")
+    if data.get("decisive_fact_index") != decisive:
+        repairs.append("decisive_fact_index_from_shared_contract")
+    checks = data.get("semantic_checks")
+    if require_semantic_checks:
+        if not isinstance(checks, dict):
+            raise ProbeValidationError("semantic_checks: editor must report visible-fact, boundary and single-product checks")
+        for key in ("answer_uses_visible_facts", "diagnostic_boundary_preserved", "single_scored_product"):
+            if checks.get(key) is not True:
+                raise ProbeValidationError(f"{key}: {checks.get('reason', 'editor did not confirm this rule')}")
+    defaults = {
+        "single_scoring_criterion": "是否给出共享技术契约内的一个证据支持的判断",
+        "answerability_check": "由技术编辑器检查可见事实依据",
+        "atomicity_check": "一个可独立评分的技术产物，允许解释依据",
+        "claim_check": "结论强度受共享技术契约限制",
+        "skill_alignment_check": f"目标机制：{scaffold['core_concept']}",
+        "visible_evidence_check": "所有共享事实由程序显示；答案依据由技术编辑器检查",
+    }
+    result = {"operation": operation, "single_task": task,
+              "answer_outline": required_text("answer_outline"),
+              "evidence_target": required_text("evidence_target"),
+              "required_fact_indices": sorted(set(indices)),
+              "decisive_fact_index": decisive, "diagnostic_anchor": anchor,
+              "diagnostic_anchor_verbatim_in_task": bool(anchor and anchor in task),
+              "diagnostic_boundary": scaffold["diagnostic_boundary"],
+              "semantic_checks": checks,
+              "semantic_check_source": "question_model_self_audit" if checks else "pending_editor",
+              "invalid_required_fact_indices": invalid,
+              "required_fact_indices_repaired": bool(repairs),
+              "diagnostic_fact_index_repaired": any("decisive_fact_index" in r for r in repairs)}
+    for key, default in defaults.items():
+        result[key] = str(data.get(key, "")).strip() or default
+        if not str(data.get(key, "")).strip():
+            repairs.append(key + "_audit_default")
+    result["repair_log"] = repairs
+    result["repaired"] = bool(repairs)
+    return result
+
+
+def draft_v27_probe(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+    rejected_attempts: Sequence[Mapping],
+) -> Dict[str, object]:
+    is_tree = question_context["prompt_variant"] == "tree_v27"
+    system = (
+        "你是V2.7证据锚定原子探针规划器。共享可见场景由程序逐字放在问题前面，你只"
+        "规划紧随其后的一个任务。只输出严格JSON：operation、single_task、"
+        "answer_outline、required_fact_indices、evidence_target、diagnostic_anchor、"
+        "single_scoring_criterion。不要输出其他字段。operation只能是predict_outcome、"
+        "trace_failure、choose_under_constraint、identify_decisive_mechanism之一。"
+        + V27_SINGLE_PRODUCT_GUIDANCE
+    )
+    if is_tree:
+        card = question_context["diagnostic_contrast_card"]
+        variant = (
+            "这是Tree探针。根据相邻状态选择一个可观察、可评分的诊断边界。必须生成一个"
+            "证据描述diagnostic_anchor；single_task允许自然概括而不逐字复制。锚点必须来自"
+            "diagnostic_boundary或决定性可见事实。任务应要求候选人依据该锚点完成一次"
+            "因果判断、约束选择或结果预测，不能只泛泛地问原因，也不能把答案写进问题。"
+            f"\n较低状态：{card['lower_hypothesis']}"
+            f"\n较高状态：{card['upper_hypothesis']}"
+            f"\n必须诱发的证据：{card['required_discriminating_evidence']}"
+        )
+    else:
+        variant = (
+            "这是Plain探针。不使用候选人后验或能力假设，围绕目标叶子技能设计一个代表性"
+            "普通面试任务。diagnostic_anchor可为空；任务仍需具体、可回答且只评分一个"
+            "结论。不得故意弱化问题。"
+        )
+    rejected = [
+        {
+            "question": str(row.get("question", ""))[:320],
+            "feedback": str(row.get("feedback", ""))[:600],
+        }
+        for row in rejected_attempts[-2:]
+    ]
+    return request_judge_json(
+        client, model, system,
+        (
+            f"目标技能：{skill}\n目标难度：{difficulty}\n"
+            f"共享可见技术契约：{json.dumps(v26_scaffold_payload(shared_scaffold), ensure_ascii=False)}\n"
+            f"共享同叶子历史：{json.dumps(question_context.get('exact_skill_history', []), ensure_ascii=False)}\n"
+            f"{variant}\n"
+            "single_scoring_criterion必须描述唯一评分单元。静默确认任务考查目标叶子技能，"
+            "且answer_outline只使用题面显示的scenario_text和stable_facts。若结论含"
+            "‘可能/需验证’，问题不得询问根本或具体原因。"
+            f"显式重试反馈：{json.dumps(rejected, ensure_ascii=False)}"
+        ),
+        parser=lambda value: parse_v27_probe_json(
+            value, len(shared_scaffold["stable_facts"]), is_tree,
+            shared_scaffold,
+        ),
+        max_tokens=1200, temperature=0.18,
+    )
+
+
+def validate_v27_probe(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+    draft: Mapping,
+) -> Dict[str, object]:
+    """Budget-matched edit that cannot erase the Tree evidence anchor."""
+    is_tree = question_context["prompt_variant"] == "tree_v27"
+    system = (
+        "你是V2.7技术有效性编辑器。你不比较两个问题。根据共享可见技术契约审查并"
+        "必要时重写一个探针。只输出严格JSON，输出operation、single_task、"
+        "answer_outline、required_fact_indices、evidence_target、diagnostic_anchor、"
+        "single_scoring_criterion和semantic_checks。最终single_task只能有"
+        "一个主要问题和一个可独立评分的技术产物，不得新增事实，"
+        "不得超过supported_conclusion。若supported_conclusion是概率判断，只能询问最"
+        "合理假设或下一项决定性验证，不能询问根本原因。Tree输入的diagnostic_anchor"
+        "语义和diagnostic_boundary必须保留，允许自然概括；不能变成泛泛提问。"
+        + V27_SINGLE_PRODUCT_GUIDANCE
+        + "另输出semantic_checks对象，包含answer_uses_visible_facts、"
+        "diagnostic_boundary_preserved、single_scored_product三个布尔值和reason。"
+        "逐项审查最终输出，只有检查实际成立才写true；Plain的边界项检查技术契约。"
+    )
+    user = (
+        f"目标技能：{skill}\n目标难度：{difficulty}\n"
+        f"探针类型：{'证据锚定' if is_tree else '普通代表性'}\n"
+        f"共享可见技术契约：{json.dumps(v26_scaffold_payload(shared_scaffold), ensure_ascii=False)}\n"
+        f"可见题面：{render_v26_visible_scenario(shared_scaffold)}\n"
+        f"待审查探针：{json.dumps({key: draft[key] for key in ('operation', 'single_task', 'answer_outline', 'required_fact_indices', 'evidence_target', 'diagnostic_anchor', 'single_scoring_criterion')}, ensure_ascii=False)}\n"
+        "静默核对目标叶子技能、全部答案事实是否可见、结论强度、单评分单元以及锚点保留。"
+    )
+    return request_judge_json(
+        client, model, system, user,
+        parser=lambda value: parse_v27_probe_json(
+            value, len(shared_scaffold["stable_facts"]), is_tree,
+            shared_scaffold, require_semantic_checks=True,
+        ),
+        max_tokens=1200, temperature=0.03,
+    )
+
+
+def generate_v27_visible_contract_question(
+    client: QwenClient,
+    question_model: str,
+    question_judge_model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+    regenerate_low_quality: bool,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+) -> Tuple[str, Dict[str, float], int, List[Dict]]:
+    attempts = []
+    rejected = []
+    maximum_attempts = max_regenerations + 1 if regenerate_low_quality else 1
+    visible_scenario = render_v26_visible_scenario(shared_scaffold)
+    for attempt_index in range(maximum_attempts):
+        draft = draft_v27_probe(
+            client, question_model, skill, difficulty, question_context,
+            shared_scaffold, rejected,
+        )
+        final_probe = validate_v27_probe(
+            client, question_model, skill, difficulty, question_context,
+            shared_scaffold, draft,
+        )
+        question = f"{visible_scenario}。{final_probe['single_task']}"
+        quality_scores, judge_details = evaluate_qwen_question(
+            client, question_judge_model, skill, difficulty, question,
+            dialogue_history, judge_repeats, question_context,
+        )
+        passes_quality = (
+            quality_scores["overall_question_quality"] >= quality_threshold
+            and quality_scores["technical_correctness"] >= 7.0
+            and quality_scores["general_question_quality"] >= 7.0
+        )
+        attempts.append({
+            "attempt": attempt_index,
+            "shared_visible_technical_contract": v26_scaffold_payload(
+                shared_scaffold
+            ),
+            "visible_scenario": visible_scenario,
+            "shared_scaffold_model_raw_output": shared_scaffold.get("raw", ""),
+            "draft_probe": {
+                key: draft[key] for key in (
+                    "operation", "single_task", "answer_outline",
+                    "required_fact_indices", "evidence_target",
+                    "diagnostic_anchor", "single_scoring_criterion",
+                    "skill_alignment_check", "visible_evidence_check",
+                )
+            },
+            "draft_probe_model_raw_output": draft.get("raw", ""),
+            "draft_probe_audit": draft,
+            "final_probe_audit": final_probe,
+            "repaired": bool(draft["repaired"] or final_probe["repaired"]),
             "draft_probe_format_retry_count": draft.get(
                 "format_retry_count", 0
             ),
@@ -6920,13 +7329,15 @@ def run_prompt_ablation_v24(
     method_version: str = "V2.4",
 ) -> Dict:
     """Run the shared-facts V2.4 family while preserving old V2.4 resumes."""
-    if method_version not in ("V2.4", "V2.5", "V2.6"):
+    if method_version not in ("V2.4", "V2.5", "V2.6", "V2.7"):
         raise ValueError(f"Unsupported shared-facts method: {method_version}")
     is_v25 = method_version == "V2.5"
-    is_v26 = method_version == "V2.6"
-    version_slug = "v26" if is_v26 else "v25" if is_v25 else "v24"
+    is_v27 = method_version == "V2.7"
+    is_v26 = method_version in ("V2.6", "V2.7")
+    version_slug = "v27" if is_v27 else "v26" if is_v26 else "v25" if is_v25 else "v24"
     output_dir = output_root / (
-        "exp11_prompt_ablation_v26" if is_v26
+        "exp12_prompt_ablation_v27" if is_v27
+        else "exp11_prompt_ablation_v26" if is_v26
         else "exp10_prompt_ablation_v25" if is_v25
         else "exp9_prompt_ablation_v24"
     )
@@ -6940,7 +7351,7 @@ def run_prompt_ablation_v24(
     tree_variant = f"prompt_tree_{version_slug}"
     variants = (plain_variant, tree_variant)
     setup = {
-        "schema_version": 7 if is_v26 else 6 if is_v25 else 5,
+        "schema_version": 8 if is_v27 else 7 if is_v26 else 6 if is_v25 else 5,
         "method_version": method_version,
         "seed": seed,
         "question_model": question_model,
@@ -7025,6 +7436,8 @@ def run_prompt_ablation_v24(
             )
 
     client = QwenClient(api_key, base_url)
+    if is_v27:
+        client.json_audit_path = output_dir / "json_requests.jsonl"
     total = n_candidates * questions
     with tqdm(
         total=total,
@@ -7102,7 +7515,8 @@ def run_prompt_ablation_v24(
                         if variant == tree_variant else f"plain_{version_slug}"
                     )
                     question, scores, regeneration_count, attempts = (
-                        generate_v26_visible_contract_question(
+                        (generate_v27_visible_contract_question if is_v27
+                         else generate_v26_visible_contract_question)(
                             client, question_model, question_judge_model,
                             skill, difficulty, history, question_judge_repeats,
                             quality_threshold, max_regenerations,
@@ -7209,6 +7623,13 @@ def run_prompt_ablation_v24(
                     ),
                     "selector": components,
                 }
+                if is_v27:
+                    pair["probe_task_exact_match"] = normalized_probe_task(
+                        generated[tree_variant]["question_generation_attempts"][-1]["single_task"]
+                    ) == normalized_probe_task(
+                        generated[plain_variant]["question_generation_attempts"][-1]["single_task"]
+                    )
+                    pair["shared_scaffold_audit"] = shared_scaffold
                 append_jsonl(pairs_path, pair)
                 grouped[profile.candidate_id].append(pair)
                 history.append({
@@ -7267,6 +7688,16 @@ def run_prompt_ablation_v24(
             for variant in variants
         },
     }
+    if is_v27:
+        result["pair_diagnostics"] = {
+            "probe_task_exact_match_rate": quality_mean([
+                float(pair["probe_task_exact_match"]) for pair in pairs
+            ]),
+            "all_contract_facts_visible_rate": quality_mean([
+                float(variant["question_generation_attempts"][-1]["all_contract_facts_visible"])
+                for pair in pairs for variant in pair["variants"].values()
+            ]),
+        }
     atomic_json(output_dir / "summary.json", result)
     atomic_json(output_dir / "counterfactual_discrimination_summary.json", discrimination)
     write_quality_csv(
@@ -7288,6 +7719,11 @@ def run_prompt_ablation_v25(**kwargs) -> Dict:
 def run_prompt_ablation_v26(**kwargs) -> Dict:
     """V2.6 entry point; earlier shared-facts modes remain resumable."""
     return run_prompt_ablation_v24(method_version="V2.6", **kwargs)
+
+
+def run_prompt_ablation_v27(**kwargs) -> Dict:
+    """V2.7 uses semantic evidence checks and observable validation failures."""
+    return run_prompt_ablation_v24(method_version="V2.7", **kwargs)
 
 
 # =============================================================================
@@ -7648,6 +8084,7 @@ def paired_question_quality_comparison(
                 ("prompt_tree_v23", "prompt_plain_v23"),
                 ("prompt_tree_v24", "prompt_plain_v24"),
                 ("prompt_tree_v25", "prompt_plain_v25"),
+                ("prompt_tree_v27", "prompt_plain_v27"),
                 ("prompt_tree_v26", "prompt_plain_v26"),
             )
             else "Strategies select different skills and difficulties, so this paired "
@@ -7721,6 +8158,7 @@ def run_question_quality_analysis(
             ("prompt_tree_v23", "prompt_plain_v23"),
             ("prompt_tree_v24", "prompt_plain_v24"),
             ("prompt_tree_v25", "prompt_plain_v25"),
+            ("prompt_tree_v27", "prompt_plain_v27"),
             ("prompt_tree_v26", "prompt_plain_v26"),
         )
         if set(pair).issubset(available_strategies)
@@ -8045,7 +8483,7 @@ def parse_args() -> argparse.Namespace:
             "prompt_ablation_v2", "prompt_ablation_v21",
             "prompt_ablation_v22", "prompt_ablation_v23",
             "prompt_ablation_v24", "prompt_ablation_v25",
-            "prompt_ablation_v26", "analyze", "all",
+            "prompt_ablation_v26", "prompt_ablation_v27", "analyze", "all",
         ],
         default="all",
     )
@@ -8100,13 +8538,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-judge-repeats", type=int, default=3)
     parser.add_argument(
         "--pairwise-judge-repeats", type=int, default=3,
-        help="Blind A/B judge repeats for prompt_ablation_v2/v21/v22/v23/v24/v25/v26",
+        help="Blind A/B judge repeats for prompt_ablation_v2/v21/v22/v23/v24/v25/v26/v27",
     )
     parser.add_argument(
         "--diagnostic-discrimination-repeats", type=int, default=1,
         help=(
             "Blind H0/H1 classification repeats per question for "
-            "prompt_ablation_v21/v22/v23/v24/v25/v26; use 0 to disable"
+            "prompt_ablation_v21/v22/v23/v24/v25/v26/v27; use 0 to disable"
         ),
     )
     parser.add_argument("--quality-threshold", type=float, default=7.0)
@@ -8234,7 +8672,7 @@ def main() -> None:
     if args.mode in (
         "qwen", "prompt_ablation", "prompt_ablation_v2",
         "prompt_ablation_v21", "prompt_ablation_v22", "prompt_ablation_v23",
-        "prompt_ablation_v24", "prompt_ablation_v25", "prompt_ablation_v26",
+        "prompt_ablation_v24", "prompt_ablation_v25", "prompt_ablation_v26", "prompt_ablation_v27",
     ):
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
@@ -8289,7 +8727,7 @@ def main() -> None:
                 + args.pairwise_judge_repeats + 1 + discrimination_calls
             )
             estimated_calls = args.qwen_candidates * args.qwen_questions * calls_per_pair
-        elif args.mode in ("prompt_ablation_v25", "prompt_ablation_v26"):
+        elif args.mode in ("prompt_ablation_v25", "prompt_ablation_v26", "prompt_ablation_v27"):
             discrimination_calls = (
                 2 * (1 + args.diagnostic_discrimination_repeats)
                 if args.diagnostic_discrimination_repeats > 0 else 0
@@ -8399,7 +8837,8 @@ def main() -> None:
                 verbose=args.verbose_results,
             )
         else:
-            result = run_prompt_ablation_v26(
+            result = (run_prompt_ablation_v27 if args.mode == "prompt_ablation_v27"
+                      else run_prompt_ablation_v26)(
                 pairwise_judge_repeats=args.pairwise_judge_repeats,
                 diagnostic_discrimination_repeats=(
                     args.diagnostic_discrimination_repeats
@@ -8407,7 +8846,7 @@ def main() -> None:
                 **common,
             )
             print_compact(
-                "V2.6 visible-evidence prompt ablation complete", result,
+                f"{'V2.7' if args.mode == 'prompt_ablation_v27' else 'V2.6'} visible-evidence prompt ablation complete", result,
                 verbose=args.verbose_results,
             )
 
