@@ -4903,6 +4903,350 @@ def generate_v27_visible_contract_question(
     )
 
 
+# V2.8 keeps V2.7 reproducible; these guards concern reasoning, not score selection.
+def build_v28_contrast_card(model, skill, history):
+    card = build_diagnostic_contrast_card(model, skill, history)
+    mean, std = card["posterior_mean"], card["posterior_std"]
+    # Fixed thresholds, not selected from observed question-quality results.
+    if mean < 4.5:
+        boundary, low, high = ("rule_application", "能复述规则，但可能遗漏规则适用的一个条件",
+                               "能将明确规则与当前案例条件对应，给出一个有依据的判断")
+    elif mean < 6.0 or std >= 2.3:
+        boundary, low, high = ("evidence_sufficiency", "可能把成功状态或相关现象当成结论的充分证据",
+                               "能区分必要与充分证据，只给出事实实际支持的结论")
+    else:
+        boundary, low, high = ("boundary_transfer", "能处理常规案例，但可能把结论推广到条件改变后的案例",
+                               "能识别一个改变的适用条件，并据此判断结论是否仍成立")
+    card.update({"boundary_type": boundary,
+                 "lower_hypothesis": f"针对{skill}：{low}。",
+                 "upper_hypothesis": f"针对{skill}：{high}。",
+                 "required_discriminating_evidence": high,
+                 "boundary_selection_policy": "fixed posterior mean/std thresholds; no quality feedback"})
+    return card
+
+
+def parse_v28_scaffold_json(raw):
+    data = decode_probe_object(raw)
+    base = parse_v26_scaffold_json(json.dumps(data, ensure_ascii=False))
+    rule = data.get("application_rule")
+    if not isinstance(rule, str) or not rule.strip():
+        raise ProbeValidationError("application_rule: state one explicit, scoped technical rule")
+    facts = base["stable_facts"]
+    # Quotes establish which facts actually support the contract, not just a valid integer.
+    quotes = data.get("evidence_quotes", [])
+    if not isinstance(quotes, list) or not quotes:
+        raise ProbeValidationError("evidence_quotes: quote the visible premises needed for the inference")
+    indices = []
+    for quote in quotes:
+        if not isinstance(quote, str) or len(normalized_probe_task(quote)) < 4:
+            raise ProbeValidationError("evidence_quotes: evidence must be a substantive visible phrase")
+        matches = [i + 1 for i, fact in enumerate(facts)
+                   if normalized_probe_task(quote) in normalized_probe_task(fact)]
+        if len(matches) != 1:
+            raise ProbeValidationError("evidence_quotes: each quote must identify one stable fact")
+        indices.extend(matches)
+    checks = data.get("contract_checks", {})
+    if not isinstance(checks, dict):
+        raise ProbeValidationError("contract_checks: must be a JSON object")
+    for key in ("conclusion_supported", "answer_not_disclosed", "one_inference"):
+        if checks.get(key) is not True:
+            raise ProbeValidationError(f"contract_checks.{key}: {checks.get('reason', 'must check the contract')}")
+    conclusion = normalized_probe_task(base["supported_conclusion"])
+    if len(conclusion) >= 8 and any(conclusion in normalized_probe_task(fact) for fact in facts):
+        raise ProbeValidationError("answer_disclosed: stable_facts contains the requested conclusion verbatim")
+    indices = sorted(set(indices))
+    base.update({"application_rule": rule.strip(), "evidence_quotes": quotes,
+                 "evidence_fact_indices": indices,
+                 "decisive_fact_index": indices[0],
+                 "evidence_index_repaired": data.get("decisive_fact_index") != indices[0],
+                 "contract_checks": checks,
+                 "contract_check_source": "question_model_self_audit"})
+    return base
+
+
+def v28_scaffold_payload(scaffold):
+    return {**v26_scaffold_payload(scaffold), **{k: scaffold[k] for k in (
+        "application_rule", "evidence_quotes", "evidence_fact_indices", "contract_checks")}}
+
+
+def render_v28_visible_scenario(scaffold):
+    return (render_v26_visible_scenario(scaffold) + "。适用规则："
+            + scaffold["application_rule"].rstrip("。"))
+
+
+def build_v28_shared_scaffold(client, model, skill, difficulty, history):
+    system = (
+        "你是V2.8共享推理契约规划器。为两种同等强度的提问提供同一组事实与技术规则。"
+        "只输出JSON字段：core_concept、scenario_text、stable_facts、answerable_scope、"
+        "assumptions_to_avoid、supported_conclusion、decisive_evidence、unsupported_claims、"
+        "diagnostic_boundary、surface_cue、decisive_fact_index、application_rule、"
+        "evidence_quotes、contract_checks。stable_facts给2至5项原始观察，application_rule给"
+        "一条明确且有适用条件的规则。应支持一次规则应用、证据充分性判断或条件迁移；"
+        "不能直接在事实中写出问题要问的结论。没有依赖图或干预证据，不能编造故障因果链。"
+        "日志声称转发成功不等于已证实业务接收，必须明确观察发生在哪个层次；已确认正确"
+        "实例则不能又断言地址解析错误。不得把相关性写成确定原因。supported_conclusion"
+        "只是私有参考答案，不显示给候选人。evidence_quotes逐字引用所有必要事实中的短句，"
+        "不能只引用一个表面状态。contract_checks包含conclusion_supported、answer_not_disclosed、"
+        "one_inference三个布尔值及reason；检查实际内容而非一律填true。"
+        + V24_SHARED_FACT_GUARD
+    )
+    user = (f"目标技能：{skill}\n目标难度：{difficulty}\n能力路径：{' → '.join(SKILL_PATHS[skill])}\n"
+            f"仅同叶子历史：{json.dumps(list(history)[-3:], ensure_ascii=False)}\n"
+            "只规划一个技能内的自足案例，不沿用其他技能背景，不制定多个技术交付项。")
+    return request_judge_json(client, model, system, user, parse_v28_scaffold_json,
+                              max_tokens=1500, temperature=0.12)
+
+
+def v28_multiple_product_reason(task):
+    reason = v27_multiple_product_reason(task)
+    if reason:
+        return reason
+    # Production examples missed in V2.7: tracing + evaluating recovery mechanisms.
+    if (re.search(r"追踪|确定|分析|推导|解释|trace|analy", task, re.I)
+            and re.search(r"传播|路径|propagat|path", task, re.I)
+            and re.search(r"(?:并|及|同时|和|以及|and).*(?:评估|分析|论证|设计|提出|评价|evaluat|design).*(?:隔离|恢复|熔断|recovery|isolation)", task, re.I)):
+        return "single_product: 故障传播分析与隔离/恢复机制评价是两个独立技术产物"
+    return ""
+
+
+def parse_v28_probe_json(raw, fact_count, require_diagnostic_anchor, scaffold,
+                         require_semantic_checks=False):
+    data = decode_probe_object(raw)
+    for key in ("single_task", "single_scoring_criterion"):
+        reason = v28_multiple_product_reason(str(data.get(key, "")))
+        if reason:
+            raise ProbeValidationError(reason)
+    result = parse_v27_probe_json(raw, fact_count, require_diagnostic_anchor,
+                                 scaffold, require_semantic_checks)
+    if require_diagnostic_anchor:
+        missing = set(scaffold["evidence_fact_indices"]) - set(result["required_fact_indices"])
+        if missing:
+            result["required_fact_indices"] = sorted(set(result["required_fact_indices"]) | missing)
+            result["repair_log"].append("supporting_evidence_indices_added")
+            result["repaired"] = True
+    return result
+
+
+def draft_v28_probe(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+    rejected_attempts: Sequence[Mapping],
+) -> Dict[str, object]:
+    is_tree = question_context["prompt_variant"] == "tree_v28"
+    system = (
+        "你是V2.8证据锚定原子探针规划器。共享可见场景由程序逐字放在问题前面，你只"
+        "规划紧随其后的一个任务。只输出严格JSON：operation、single_task、"
+        "answer_outline、required_fact_indices、evidence_target、diagnostic_anchor、"
+        "single_scoring_criterion。不要输出其他字段。operation只能是predict_outcome、"
+        "trace_failure、choose_under_constraint、identify_decisive_mechanism之一。"
+        + V27_SINGLE_PRODUCT_GUIDANCE
+        + "只要求一个证据支持的结论，不增加修复、预防、全路径或额外权衡。规则已显示在题面，"
+        "问题应要求应用规则而非复述某条已给出的答案。追踪传播并评价恢复机制是多任务。"
+    )
+    if is_tree:
+        card = question_context["diagnostic_contrast_card"]
+        variant = (
+            "这是Tree探针。根据相邻状态选择一个可观察、可评分的诊断边界。必须生成一个"
+            "证据描述diagnostic_anchor；single_task允许自然概括而不逐字复制。锚点必须来自"
+            "diagnostic_boundary或决定性可见事实。任务应要求候选人依据该锚点完成一次"
+            "因果判断、约束选择或结果预测，不能只泛泛地问原因，也不能把答案写进问题。"
+            f"\n较低状态：{card['lower_hypothesis']}"
+            f"\n较高状态：{card['upper_hypothesis']}"
+            f"\n必须诱发的证据：{card['required_discriminating_evidence']}"
+        )
+    else:
+        variant = (
+            "这是Plain探针。不使用候选人后验或能力假设，围绕目标叶子技能设计一个代表性"
+            "普通面试任务。diagnostic_anchor可为空；任务仍需具体、可回答且只评分一个"
+            "结论。不得故意弱化问题。"
+        )
+    rejected = [
+        {
+            "question": str(row.get("question", ""))[:320],
+            "feedback": str(row.get("feedback", ""))[:600],
+        }
+        for row in rejected_attempts[-2:]
+    ]
+    return request_judge_json(
+        client, model, system,
+        (
+            f"目标技能：{skill}\n目标难度：{difficulty}\n"
+            f"共享可见技术契约：{json.dumps(v28_scaffold_payload(shared_scaffold), ensure_ascii=False)}\n"
+            f"共享同叶子历史：{json.dumps(question_context.get('exact_skill_history', []), ensure_ascii=False)}\n"
+            f"{variant}\n"
+            "single_scoring_criterion必须描述唯一评分单元。静默确认任务考查目标叶子技能，"
+            "且answer_outline只使用题面显示的scenario_text和stable_facts。若结论含"
+            "‘可能/需验证’，问题不得询问根本或具体原因。"
+            f"显式重试反馈：{json.dumps(rejected, ensure_ascii=False)}"
+        ),
+        parser=lambda value: parse_v28_probe_json(
+            value, len(shared_scaffold["stable_facts"]), is_tree,
+            shared_scaffold,
+        ),
+        max_tokens=1200, temperature=0.18,
+    )
+
+
+def validate_v28_probe(
+    client: QwenClient,
+    model: str,
+    skill: str,
+    difficulty: str,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+    draft: Mapping,
+) -> Dict[str, object]:
+    """Budget-matched edit that cannot erase the Tree evidence anchor."""
+    is_tree = question_context["prompt_variant"] == "tree_v28"
+    system = (
+        "你是V2.8技术有效性编辑器。你不比较两个问题。根据共享可见技术契约审查并"
+        "必要时重写一个探针。只输出严格JSON，输出operation、single_task、"
+        "answer_outline、required_fact_indices、evidence_target、diagnostic_anchor、"
+        "single_scoring_criterion和semantic_checks。最终single_task只能有"
+        "一个主要问题和一个可独立评分的技术产物，不得新增事实，"
+        "不得超过supported_conclusion。若supported_conclusion是概率判断，只能询问最"
+        "合理假设或下一项决定性验证，不能询问根本原因。Tree输入的diagnostic_anchor"
+        "语义和diagnostic_boundary必须保留，允许自然概括；不能变成泛泛提问。"
+        + V27_SINGLE_PRODUCT_GUIDANCE
+        + "只要求一个证据支持的结论，不增加修复、预防、全路径或额外权衡。规则已显示在题面，"
+        "问题应要求应用规则而非复述某条已给出的答案。追踪传播并评价恢复机制是多任务。"
+        + "另输出semantic_checks对象，包含answer_uses_visible_facts、"
+        "diagnostic_boundary_preserved、single_scored_product三个布尔值和reason。"
+        "逐项审查最终输出，只有检查实际成立才写true；Plain的边界项检查技术契约。"
+    )
+    user = (
+        f"目标技能：{skill}\n目标难度：{difficulty}\n"
+        f"探针类型：{'证据锚定' if is_tree else '普通代表性'}\n"
+        f"共享可见技术契约：{json.dumps(v28_scaffold_payload(shared_scaffold), ensure_ascii=False)}\n"
+        f"可见题面：{render_v28_visible_scenario(shared_scaffold)}\n"
+        f"待审查探针：{json.dumps({key: draft[key] for key in ('operation', 'single_task', 'answer_outline', 'required_fact_indices', 'evidence_target', 'diagnostic_anchor', 'single_scoring_criterion')}, ensure_ascii=False)}\n"
+        "静默核对目标叶子技能、全部答案事实是否可见、结论强度、单评分单元以及锚点保留。"
+    )
+    return request_judge_json(
+        client, model, system, user,
+        parser=lambda value: parse_v28_probe_json(
+            value, len(shared_scaffold["stable_facts"]), is_tree,
+            shared_scaffold, require_semantic_checks=True,
+        ),
+        max_tokens=1200, temperature=0.03,
+    )
+
+
+def generate_v28_visible_contract_question(
+    client: QwenClient,
+    question_model: str,
+    question_judge_model: str,
+    skill: str,
+    difficulty: str,
+    dialogue_history: Sequence[Mapping],
+    judge_repeats: int,
+    quality_threshold: float,
+    max_regenerations: int,
+    regenerate_low_quality: bool,
+    question_context: Mapping,
+    shared_scaffold: Mapping,
+) -> Tuple[str, Dict[str, float], int, List[Dict]]:
+    attempts = []
+    rejected = []
+    maximum_attempts = max_regenerations + 1 if regenerate_low_quality else 1
+    visible_scenario = render_v28_visible_scenario(shared_scaffold)
+    for attempt_index in range(maximum_attempts):
+        draft = draft_v28_probe(
+            client, question_model, skill, difficulty, question_context,
+            shared_scaffold, rejected,
+        )
+        final_probe = validate_v28_probe(
+            client, question_model, skill, difficulty, question_context,
+            shared_scaffold, draft,
+        )
+        question = f"{visible_scenario}。{final_probe['single_task']}"
+        quality_scores, judge_details = evaluate_qwen_question(
+            client, question_judge_model, skill, difficulty, question,
+            dialogue_history, judge_repeats, question_context,
+        )
+        passes_quality = (
+            quality_scores["overall_question_quality"] >= quality_threshold
+            and quality_scores["technical_correctness"] >= 7.0
+            and quality_scores["general_question_quality"] >= 7.0
+        )
+        attempts.append({
+            "attempt": attempt_index,
+            "shared_visible_technical_contract": v28_scaffold_payload(
+                shared_scaffold
+            ),
+            "visible_scenario": visible_scenario,
+            "shared_scaffold_model_raw_output": shared_scaffold.get("raw", ""),
+            "draft_probe": {
+                key: draft[key] for key in (
+                    "operation", "single_task", "answer_outline",
+                    "required_fact_indices", "evidence_target",
+                    "diagnostic_anchor", "single_scoring_criterion",
+                    "skill_alignment_check", "visible_evidence_check",
+                )
+            },
+            "draft_probe_model_raw_output": draft.get("raw", ""),
+            "draft_probe_audit": draft,
+            "final_probe_audit": final_probe,
+            "repaired": bool(draft["repaired"] or final_probe["repaired"]),
+            "draft_probe_format_retry_count": draft.get(
+                "format_retry_count", 0
+            ),
+            **{
+                key: final_probe[key] for key in (
+                    "operation", "single_task", "answer_outline",
+                    "required_fact_indices", "evidence_target",
+                    "answerability_check", "atomicity_check", "claim_check",
+                    "diagnostic_anchor", "single_scoring_criterion",
+                    "skill_alignment_check", "visible_evidence_check",
+                )
+            },
+            "required_fact_indices_repaired": final_probe[
+                "required_fact_indices_repaired"
+            ],
+            "invalid_required_fact_indices": final_probe[
+                "invalid_required_fact_indices"
+            ],
+            "validation_model_raw_output": final_probe.get("raw", ""),
+            "validation_format_retry_count": final_probe.get(
+                "format_retry_count", 0
+            ),
+            "question": question,
+            "question_model_raw_output": final_probe.get("raw", ""),
+            "quality_scores": quality_scores,
+            "question_judge_details": judge_details,
+            "generation_pipeline": (
+                "visible_contract_then_anchored_atomic_probe_then_anchor_preserving_edit"
+            ),
+            "technical_validity_guard": True,
+            "all_contract_facts_visible": all(
+                normalized_probe_task(str(fact))
+                in normalized_probe_task(question)
+                for fact in shared_scaffold["stable_facts"]
+            ),
+            "strategy_leakage_flags": v21_question_leakage_flags(question),
+            "explicit_retry_gate_passed": passes_quality,
+        })
+        if not regenerate_low_quality or passes_quality:
+            break
+        rejected.append({
+            "question": question,
+            "feedback": (
+                "; ".join(
+                    row["reason"] for row in judge_details if row["reason"]
+                )
+            )[:1000],
+        })
+    accepted = attempts[-1]
+    return (
+        accepted["question"], accepted["quality_scores"],
+        len(attempts) - 1, attempts,
+    )
+
+
 def parse_counterfactual_answers_json(raw: str) -> Dict[str, str]:
     data = _json_object_from_text(raw, "Counterfactual answer")
     lower = str(data["lower_answer"]).strip()
@@ -4945,6 +5289,7 @@ def evaluate_counterfactual_discrimination(
     pair_id: str,
     variant: str,
     responsive_only: bool = False,
+    controlled_v28: bool = False,
 ) -> Dict[str, object]:
     """Test whether answers elicited by a question reveal adjacent H0/H1 states."""
     if repeats < 1:
@@ -4971,6 +5316,13 @@ def evaluate_counterfactual_discrimination(
             f"需要观察的证据：{contrast_card['required_discriminating_evidence']}"
         )
     )
+    if controlled_v28:
+        answer_system += (
+            "V2.8控制：每份回答统一使用‘结论：…；依据：…’两段，总长度80至120个字符，"
+            "两份长度之比不超过1.25。只说明同一判断及其一个依据；不提解决方案、"
+            "预防措施、工具清单或题目没有要求的工程权衡。两状态只在应用当前规则的"
+            "推理上不同，允许同样正确或同样不能区分，禁止为了区分而编造额外知识。"
+        )
     answer_pair = request_judge_json(
         client, answer_model, answer_system, answer_user,
         parse_counterfactual_answers_json, max_tokens=1000, temperature=0.65,
@@ -4983,6 +5335,12 @@ def evaluate_counterfactual_discrimination(
         "不得根据回答长度或文风判断。只输出JSON：answer_a_state与answer_b_state只能是"
         "H0或H1，question_diagnosticity为1到10，confidence为1到5，reason为简短理由。"
     )
+    if controlled_v28:
+        judge_system += (
+            "V2.8：只依据问题实际要求的结论与依据区分状态。额外方案、篇幅、术语数量"
+            "不计作能力证据；两回答若核心推理相同，question_diagnosticity应反映无法区分。"
+            "不要为了匹配预设H0/H1而强行给高诊断分。"
+        )
     details = []
     base_lower_is_a = stable_seed("v21-discrimination-order", pair_id, variant) % 2 == 0
     for repeat in range(repeats):
@@ -5040,6 +5398,15 @@ def evaluate_counterfactual_discrimination(
             float(row["confidence"]) for row in details
         ]),
         "details": details,
+        **({"response_control_audit": {
+            "lower_characters": len(lower_answer), "upper_characters": len(upper_answer),
+            "length_ratio": max(len(lower_answer), len(upper_answer)) / max(1, min(len(lower_answer), len(upper_answer))),
+            "length_matched": max(len(lower_answer), len(upper_answer)) <= 1.25 * min(len(lower_answer), len(upper_answer)),
+            "both_within_length_band": all(80 <= len(answer) <= 120 for answer in (lower_answer, upper_answer)),
+            "both_use_requested_structure": all("结论：" in answer and "依据：" in answer for answer in (lower_answer, upper_answer)),
+            "potential_unrequested_deliverables": any(re.search(r"修复方案|预防措施|建议增加|解决方案|推荐", answer) for answer in (lower_answer, upper_answer)),
+            "retained_even_if_control_failed": True,
+        }} if controlled_v28 else {}),
     }
 
 
@@ -5076,6 +5443,7 @@ def evaluate_question_pair(
     tree_variant: str = "prompt_tree_v2",
     plain_variant: str = "prompt_plain_v2",
     strict_technical_gate: bool = False,
+    semantic_audit: bool = False,
 ) -> Dict[str, object]:
     """Blind, order-randomized pairwise preference evaluation."""
     if repeats < 1:
@@ -5101,6 +5469,17 @@ def evaluate_question_pair(
             "要求技术正确、清晰且只有一个主要任务。你不知道问题来自哪种策略。只输出"
             "JSON：winner必须为A、B或TIE，confidence为1到5，reason为简短理由。"
         )
+    if semantic_audit:
+        system += ("额外输出same_reasoning_task布尔值和semantic_reason：两题是否只改措辞，"
+                   "而要求相同结论和同一推理过程。不能因为出现‘依据证据’就判为不同任务。"
+                   "不要将额外任务或与诊断目标词语相似本身当作优势。")
+    def parse_response(raw):
+        parsed = parse_pairwise_judge_json(raw)
+        if semantic_audit:
+            data = decode_probe_object(raw)
+            parsed["same_reasoning_task"] = data.get("same_reasoning_task") if isinstance(data.get("same_reasoning_task"), bool) else None
+            parsed["semantic_reason"] = str(data.get("semantic_reason", ""))
+        return parsed
     details = []
     base_tree_is_a = stable_seed("pair-order", pair_id) % 2 == 0
     for repeat in range(repeats):
@@ -5114,7 +5493,7 @@ def evaluate_question_pair(
             f"问题A：{question_a}\n问题B：{question_b}"
         )
         judged = request_judge_json(
-            client, model, system, user, parse_pairwise_judge_json, max_tokens=350,
+            client, model, system, user, parse_response, max_tokens=550 if semantic_audit else 350,
         )
         displayed_winner = str(judged["winner"])
         if displayed_winner == "TIE":
@@ -7329,14 +7708,16 @@ def run_prompt_ablation_v24(
     method_version: str = "V2.4",
 ) -> Dict:
     """Run the shared-facts V2.4 family while preserving old V2.4 resumes."""
-    if method_version not in ("V2.4", "V2.5", "V2.6", "V2.7"):
+    if method_version not in ("V2.4", "V2.5", "V2.6", "V2.7", "V2.8"):
         raise ValueError(f"Unsupported shared-facts method: {method_version}")
     is_v25 = method_version == "V2.5"
-    is_v27 = method_version == "V2.7"
-    is_v26 = method_version in ("V2.6", "V2.7")
-    version_slug = "v27" if is_v27 else "v26" if is_v26 else "v25" if is_v25 else "v24"
+    is_v28 = method_version == "V2.8"
+    is_v27 = method_version in ("V2.7", "V2.8")
+    is_v26 = method_version in ("V2.6", "V2.7", "V2.8")
+    version_slug = "v28" if is_v28 else "v27" if is_v27 else "v26" if is_v26 else "v25" if is_v25 else "v24"
     output_dir = output_root / (
-        "exp12_prompt_ablation_v27" if is_v27
+        "exp13_prompt_ablation_v28" if is_v28
+        else "exp12_prompt_ablation_v27" if is_v27
         else "exp11_prompt_ablation_v26" if is_v26
         else "exp10_prompt_ablation_v25" if is_v25
         else "exp9_prompt_ablation_v24"
@@ -7351,7 +7732,7 @@ def run_prompt_ablation_v24(
     tree_variant = f"prompt_tree_{version_slug}"
     variants = (plain_variant, tree_variant)
     setup = {
-        "schema_version": 8 if is_v27 else 7 if is_v26 else 6 if is_v25 else 5,
+        "schema_version": 9 if is_v28 else 8 if is_v27 else 7 if is_v26 else 6 if is_v25 else 5,
         "method_version": method_version,
         "seed": seed,
         "question_model": question_model,
@@ -7398,6 +7779,10 @@ def run_prompt_ablation_v24(
         "technical_correctness_role": "validity safeguard; target delta >= -0.05",
         "earlier_prompt_modes_preserved": True,
     }
+    if is_v28:
+        setup["generation_pipeline"] = "shared rule and observation contract; posterior-specific single inference; matched evidence check"
+        setup["counterfactual_controls"] = "80-120 characters, conclusion/evidence, ratio<=1.25; violations retained and audited"
+        setup["measurement_version"] = "V2.8 counterfactual prompt changed; not directly comparable to V2.7"
     if setup_path.exists():
         saved_setup = json.loads(setup_path.read_text(encoding="utf-8"))
         if saved_setup != setup:
@@ -7473,7 +7858,7 @@ def run_prompt_ablation_v24(
                     "bridge", model, skill, components, history,
                 )
                 exact_history = v24_exact_skill_history(history, skill)
-                contrast_card = build_diagnostic_contrast_card(
+                contrast_card = (build_v28_contrast_card if is_v28 else build_diagnostic_contrast_card)(
                     model, skill, exact_history,
                 )
                 base_context["diagnostic_contrast_card"] = contrast_card
@@ -7492,7 +7877,7 @@ def run_prompt_ablation_v24(
                     f"{version_slug}-c{profile.candidate_id:03d}-t{turn:03d}"
                 )
                 shared_scaffold = (
-                    build_v26_shared_scaffold(
+                    (build_v28_shared_scaffold if is_v28 else build_v26_shared_scaffold)(
                         client, question_model, skill, difficulty, exact_history,
                     )
                     if is_v26 else
@@ -7515,7 +7900,8 @@ def run_prompt_ablation_v24(
                         if variant == tree_variant else f"plain_{version_slug}"
                     )
                     question, scores, regeneration_count, attempts = (
-                        (generate_v27_visible_contract_question if is_v27
+                        (generate_v28_visible_contract_question if is_v28
+                         else generate_v27_visible_contract_question if is_v27
                          else generate_v26_visible_contract_question)(
                             client, question_model, question_judge_model,
                             skill, difficulty, history, question_judge_repeats,
@@ -7549,6 +7935,7 @@ def run_prompt_ablation_v24(
                         pair_id=pair_id,
                         variant=variant,
                         responsive_only=True,
+                        controlled_v28=is_v28,
                     )
                     generated[variant] = {
                         "question": question,
@@ -7566,6 +7953,7 @@ def run_prompt_ablation_v24(
                     history, base_context, pairwise_judge_repeats, pair_id,
                     tree_variant=tree_variant, plain_variant=plain_variant,
                     strict_technical_gate=True,
+                    semantic_audit=is_v28,
                 )
                 canonical_question = generated[tree_variant]["question"]
                 answer = generate_qwen_answer(
@@ -7596,7 +7984,7 @@ def run_prompt_ablation_v24(
                     "quality_threshold": quality_threshold,
                     "quality_gate_enabled": regenerate_low_quality,
                     "shared_factual_scaffold": (
-                        v26_scaffold_payload(shared_scaffold)
+                        v28_scaffold_payload(shared_scaffold) if is_v28 else v26_scaffold_payload(shared_scaffold)
                         if is_v26 else
                         v25_scaffold_payload(shared_scaffold)
                         if is_v25 else v24_scaffold_payload(shared_scaffold)
@@ -7698,6 +8086,22 @@ def run_prompt_ablation_v24(
                 for pair in pairs for variant in pair["variants"].values()
             ]),
         }
+    if is_v28:
+        votes = [d.get("same_reasoning_task") for pair in pairs
+                 for d in pair["pairwise_evaluation"]["details"]]
+        known = [v for v in votes if isinstance(v, bool)]
+        audits = [g["counterfactual_discrimination"].get("response_control_audit")
+                  for pair in pairs for g in pair["variants"].values()]
+        audits = [a for a in audits if a]
+        result["v28_audit"] = {
+            "same_reasoning_task_rate": quality_mean([float(v) for v in known]) if known else None,
+            "semantic_audit_missing_rate": 1 - len(known) / max(1, len(votes)),
+            "counterfactual_controls_pass_rate": quality_mean([
+                float(a["length_matched"] and a["both_within_length_band"]
+                      and a["both_use_requested_structure"] and not a["potential_unrequested_deliverables"])
+                for a in audits]) if audits else None,
+            "controls_are_audits_not_sample_filters": True,
+        }
     atomic_json(output_dir / "summary.json", result)
     atomic_json(output_dir / "counterfactual_discrimination_summary.json", discrimination)
     write_quality_csv(
@@ -7724,6 +8128,10 @@ def run_prompt_ablation_v26(**kwargs) -> Dict:
 def run_prompt_ablation_v27(**kwargs) -> Dict:
     """V2.7 uses semantic evidence checks and observable validation failures."""
     return run_prompt_ablation_v24(method_version="V2.7", **kwargs)
+
+
+def run_prompt_ablation_v28(**kwargs):
+    return run_prompt_ablation_v24(method_version="V2.8", **kwargs)
 
 
 # =============================================================================
@@ -8084,6 +8492,7 @@ def paired_question_quality_comparison(
                 ("prompt_tree_v23", "prompt_plain_v23"),
                 ("prompt_tree_v24", "prompt_plain_v24"),
                 ("prompt_tree_v25", "prompt_plain_v25"),
+                ("prompt_tree_v28", "prompt_plain_v28"),
                 ("prompt_tree_v27", "prompt_plain_v27"),
                 ("prompt_tree_v26", "prompt_plain_v26"),
             )
@@ -8158,6 +8567,7 @@ def run_question_quality_analysis(
             ("prompt_tree_v23", "prompt_plain_v23"),
             ("prompt_tree_v24", "prompt_plain_v24"),
             ("prompt_tree_v25", "prompt_plain_v25"),
+            ("prompt_tree_v28", "prompt_plain_v28"),
             ("prompt_tree_v27", "prompt_plain_v27"),
             ("prompt_tree_v26", "prompt_plain_v26"),
         )
@@ -8468,6 +8878,13 @@ def print_compact(title: str, result: Dict, verbose: bool = False) -> None:
         or result.get("paired_prompt_comparison", {}).get("available")
     ):
         print_prompt_key_metrics(title, result)
+        if result.get("v28_audit"):
+            audit = result["v28_audit"]
+            def percentage(value):
+                return "N/A" if value is None else f"{100 * value:.2f}%"
+            print("V2.8 audit: semantic-task-match=" + percentage(audit["same_reasoning_task_rate"])
+                  + ", missing=" + percentage(audit["semantic_audit_missing_rate"])
+                  + ", counterfactual-controls-pass=" + percentage(audit["counterfactual_controls_pass_rate"]))
         return
     print(f"\n{title}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -8483,7 +8900,7 @@ def parse_args() -> argparse.Namespace:
             "prompt_ablation_v2", "prompt_ablation_v21",
             "prompt_ablation_v22", "prompt_ablation_v23",
             "prompt_ablation_v24", "prompt_ablation_v25",
-            "prompt_ablation_v26", "prompt_ablation_v27", "analyze", "all",
+            "prompt_ablation_v26", "prompt_ablation_v27", "prompt_ablation_v28", "analyze", "all",
         ],
         default="all",
     )
@@ -8538,13 +8955,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-judge-repeats", type=int, default=3)
     parser.add_argument(
         "--pairwise-judge-repeats", type=int, default=3,
-        help="Blind A/B judge repeats for prompt_ablation_v2/v21/v22/v23/v24/v25/v26/v27",
+        help="Blind A/B judge repeats for prompt_ablation_v2/v21/v22/v23/v24/v25/v26/v27/v28",
     )
     parser.add_argument(
         "--diagnostic-discrimination-repeats", type=int, default=1,
         help=(
             "Blind H0/H1 classification repeats per question for "
-            "prompt_ablation_v21/v22/v23/v24/v25/v26/v27; use 0 to disable"
+            "prompt_ablation_v21/v22/v23/v24/v25/v26/v27/v28; use 0 to disable"
         ),
     )
     parser.add_argument("--quality-threshold", type=float, default=7.0)
@@ -8672,7 +9089,7 @@ def main() -> None:
     if args.mode in (
         "qwen", "prompt_ablation", "prompt_ablation_v2",
         "prompt_ablation_v21", "prompt_ablation_v22", "prompt_ablation_v23",
-        "prompt_ablation_v24", "prompt_ablation_v25", "prompt_ablation_v26", "prompt_ablation_v27",
+        "prompt_ablation_v24", "prompt_ablation_v25", "prompt_ablation_v26", "prompt_ablation_v27", "prompt_ablation_v28",
     ):
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
@@ -8727,7 +9144,7 @@ def main() -> None:
                 + args.pairwise_judge_repeats + 1 + discrimination_calls
             )
             estimated_calls = args.qwen_candidates * args.qwen_questions * calls_per_pair
-        elif args.mode in ("prompt_ablation_v25", "prompt_ablation_v26", "prompt_ablation_v27"):
+        elif args.mode in ("prompt_ablation_v25", "prompt_ablation_v26", "prompt_ablation_v27", "prompt_ablation_v28"):
             discrimination_calls = (
                 2 * (1 + args.diagnostic_discrimination_repeats)
                 if args.diagnostic_discrimination_repeats > 0 else 0
@@ -8837,7 +9254,8 @@ def main() -> None:
                 verbose=args.verbose_results,
             )
         else:
-            result = (run_prompt_ablation_v27 if args.mode == "prompt_ablation_v27"
+            result = (run_prompt_ablation_v28 if args.mode == "prompt_ablation_v28"
+                      else run_prompt_ablation_v27 if args.mode == "prompt_ablation_v27"
                       else run_prompt_ablation_v26)(
                 pairwise_judge_repeats=args.pairwise_judge_repeats,
                 diagnostic_discrimination_repeats=(
@@ -8846,7 +9264,7 @@ def main() -> None:
                 **common,
             )
             print_compact(
-                f"{'V2.7' if args.mode == 'prompt_ablation_v27' else 'V2.6'} visible-evidence prompt ablation complete", result,
+                f"{'V2.8' if args.mode == 'prompt_ablation_v28' else 'V2.7' if args.mode == 'prompt_ablation_v27' else 'V2.6'} visible-evidence prompt ablation complete", result,
                 verbose=args.verbose_results,
             )
 
